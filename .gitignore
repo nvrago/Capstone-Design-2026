@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+.venv/
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Data (large files - keep structure, ignore contents)
+data/*
+!data/.gitkeep
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Config overrides (keep templates)
+config/*.local.yaml
+
+# Calibration data (machine-specific)
+config/calibration_*.yaml
+
+# Temporary files
+*.tmp
+*.bak

@@ -1,0 +1,16 @@
+# Core dependencies
+numpy>=1.24.0
+opencv-python>=4.8.0
+open3d>=0.17.0
+pyserial>=3.5
+pyyaml>=6.0
+
+# Pi Camera (install via apt if issues: sudo apt install python3-picamera2)
+picamera2>=0.3.12
+
+# OpenCAMLib - may need manual install on ARM64
+# See scripts/install_opencamlib.sh
+# opencamlib>=2023.1.11
+
+# Development
+pytest>=7.0.0

@@ -1,0 +1,61 @@
+# Processing Configuration
+
+# Point cloud processing
+pointcloud:
+  # Statistical outlier removal
+  outlier_removal:
+    nb_neighbors: 20
+    std_ratio: 2.0
+  # Voxel downsampling (set to null to disable)
+  voxel_size: 0.5  # mm
+  # Normal estimation
+  normal_radius: 2.0  # mm
+
+# Mesh reconstruction
+mesh:
+  # Method: poisson, ball_pivoting, or alpha_shape
+  method: poisson
+  poisson:
+    depth: 9
+    width: 0
+    scale: 1.1
+    linear_fit: false
+  ball_pivoting:
+    radii: [0.5, 1.0, 2.0]  # mm
+  # Post-processing
+  smooth_iterations: 1
+  simplify_target: null  # target triangle count, null to disable
+
+# Toolpath generation (OpenCAMLib)
+toolpath:
+  # Cutter definition
+  cutter:
+    type: cylindrical    # cylindrical, ball, bull
+    diameter: 6.0        # mm
+    length: 25.0         # mm
+    # For bull cutter
+    corner_radius: 0.0   # mm
+  
+  # Operation type
+  operation: surface     # surface, waterline, or both
+  
+  # Surface (drop cutter) settings
+  surface:
+    stepover: 2.0        # mm between passes
+    direction: x         # x, y, or both (crosshatch)
+    
+  # Waterline (contour) settings  
+  waterline:
+    z_step: 1.0          # mm between Z levels
+    
+  # Safety
+  clearance_height: 10.0  # mm above highest point
+  
+# G-code output
+gcode:
+  feed_rate: 500         # mm/min for cutting
+  plunge_rate: 100       # mm/min for Z moves
+  spindle_speed: 10000   # RPM
+  coolant: false
+  # Post-processor style
+  dialect: grbl          # grbl, linuxcnc, or generic

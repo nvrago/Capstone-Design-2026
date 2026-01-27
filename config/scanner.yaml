@@ -1,0 +1,40 @@
+# Scanner Configuration
+
+camera:
+  resolution:
+    width: 1920
+    height: 1080
+  # Global shutter recommended for moving captures
+  # exposure_time: 10000  # microseconds, adjust for laser visibility
+  
+# Laser detection parameters
+laser:
+  # HSV thresholds for red laser detection
+  hsv_lower: [0, 100, 100]
+  hsv_upper: [10, 255, 255]
+  # Secondary range for red wraparound
+  hsv_lower_alt: [170, 100, 100]
+  hsv_upper_alt: [180, 255, 255]
+  # Minimum contour area to filter noise
+  min_area: 5
+  # Subpixel refinement
+  use_subpixel: true
+
+# Triangulation geometry
+# Both laser and camera at 45° pointing inward
+triangulation:
+  baseline: 100.0        # mm between laser and camera optical axes
+  laser_angle: 45.0      # degrees from vertical
+  camera_angle: 45.0     # degrees from vertical
+  
+# Camera intrinsics (populate after calibration)
+calibration:
+  camera_matrix: null    # 3x3 matrix
+  dist_coeffs: null      # distortion coefficients
+  laser_plane: null      # plane equation [a, b, c, d]
+
+# Scan pattern
+scan_pattern:
+  type: raster           # raster, spiral, or adaptive
+  step_size: 2.0         # mm between scan lines
+  overlap: 0.2           # fraction of overlap between passes
