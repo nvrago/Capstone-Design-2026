@@ -42,30 +42,30 @@ pip install -r requirements.txt
 ```
 scan-to-cnc/
 ├── config/
-│   ├── machine.yaml      # CNC/GRBL settings
-│   ├── scanner.yaml      # Camera and laser parameters
-│   └── processing.yaml   # Mesh and toolpath settings
+│   ├── machine.yaml # CNC/GRBL settings
+│   ├── scanner.yaml # Camera and laser parameters
+│   └── processing.yaml # Mesh and toolpath settings
 ├── src/
 │   ├── cnc/
-│   │   ├── grbl.py       # GRBL serial communication
-│   │   └── motion.py     # Scan patterns and path planning
+│   │   ├── grbl.py # GRBL serial communication
+│   │   └── motion.py # Scan patterns and path planning
 │   ├── scanner/
-│   │   ├── camera.py     # Pi Camera capture
-│   │   ├── laser.py      # Laser line detection
+│   │   ├── camera.py # Pi Camera capture
+│   │   ├── laser.py # Laser line detection
 │   │   └── triangulation.py
 │   ├── processing/
 │   │   ├── pointcloud.py # Point cloud operations
-│   │   ├── mesh.py       # Surface reconstruction
-│   │   └── toolpath.py   # OpenCAMLib wrapper
+│   │   ├── mesh.py # Surface reconstruction
+│   │   └── toolpath.py # OpenCAMLib wrapper
 │   ├── gcode/
-│   │   └── writer.py     # G-code generation
-│   └── pipeline.py       # Main orchestration
+│   │   └── writer.py # G-code generation
+│   └── pipeline.py # Main orchestration
 ├── scripts/
-│   ├── calibrate.py      # Camera/laser calibration
-│   ├── scan.py           # Run a scan job
-│   └── process.py        # Process existing point cloud
+│   ├── calibrate.py # Camera/laser calibration
+│   ├── scan.py # Run a scan job
+│   └── process.py # Process existing point cloud
 ├── tests/
-├── data/                 # Output: scans, meshes, gcode
+├── data/ # Output: scans, meshes, gcode
 └── requirements.txt
 ```
 
@@ -100,6 +100,4 @@ work_envelope:
 ```
 
 ## License
-
 MIT
-```
