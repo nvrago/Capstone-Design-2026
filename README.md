@@ -5,7 +5,7 @@ Automated 3D scanning and CNC toolpath generation pipeline for Raspberry Pi 5.
 ## Overview
 
 This project integrates:
-- **Structured light 3D scanning** using grid laser + Pi Camera
+- **Structured light 3D scanning** using a Intel Realsense D405
 - **CNC control** via GRBL 1.1 serial communication
 - **Point cloud processing** with Open3D
 - **Toolpath generation** with OpenCAMLib
@@ -15,8 +15,7 @@ This project integrates:
 
 - Raspberry Pi 5 (16GB)
 - Genmitsu 3020 Pro CNC (GRBL 1.1f)
-- Pi Camera (global shutter recommended)
-- Grid laser module (red, 635nm)
+- Intel Realsense D405
 - Samsung 1TB SSD (for data storage)
 
 ## Installation
