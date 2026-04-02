@@ -1,40 +1,33 @@
-# CNC Machine Configuration - Genmitsu 3020 Pro
+# cnc machine configuration - genmitsu 3020 pro
 
 serial:
   port: /dev/ttyUSB0
   baud_rate: 115200
-  timeout: 2.0  # seconds
+  timeout: 2.0
 
-# Work envelope in mm
+# work envelope in mm
 work_envelope:
   x: 300
   y: 200
   z: 60
 
-# GRBL settings reference (query with $$ command)
-# These should match your machine's $$ configuration
+# grbl settings reference (query with $$ command)
 grbl:
   steps_per_mm:
     x: 800
     y: 800
     z: 800
-  max_feed_rate:  # mm/min
+  max_feed_rate:
     x: 1000
     y: 1000
     z: 500
-  acceleration:  # mm/sec^2
+  acceleration:
     x: 50
     y: 50
     z: 50
 
-# Safety limits
+# safety limits
 limits:
   soft_limits: true
   hard_limits: true
   homing_cycle: true
-
-# Scanning motion parameters
-scan_motion:
-  feed_rate: 500      # mm/min during scanning
-  rapid_rate: 1000    # mm/min for repositioning
-  settle_time: 0.1    # seconds to wait after move before capture
