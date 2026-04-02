@@ -22,19 +22,34 @@ This project integrates:
 ## Installation
 
 ```bash
-# Clone the repo
+# clone the repo
 git clone https://github.com/yourusername/scan-to-cnc.git
 cd scan-to-cnc
 
-# Create virtual environment
+# create virtual environment
 python3 -m venv venv
 source venv/bin/activate
 
-# Install dependencies
+# install dependencies
 pip install -r requirements.txt
 
-# Install OpenCAMLib (may require build from source on ARM64)
-./scripts/install_opencamlib.sh
+# install librealsense sdk (required for pyrealsense2)
+# ubuntu/debian:
+sudo apt install librealsense2-dev librealsense2-utils
+
+# raspberry pi 5 (build from source):
+# see https://github.com/IntelRealSense/librealsense/blob/master/doc/installation_raspbian.md
+
+# install opencamlib (may require build from source on arm64)
+pip install opencamlib
+# if pip install fails on arm64:
+# git clone https://github.com/aewallin/opencamlib.git
+# cd opencamlib && mkdir build && cd build
+# cmake .. && make -j4 && sudo make install
+
+# verify realsense connection
+realsense-viewer  # gui check (optional)
+rs-enumerate-devices  # headless check
 ```
 
 ## Project Structure
@@ -42,62 +57,93 @@ pip install -r requirements.txt
 ```
 scan-to-cnc/
 ├── config/
-│   ├── machine.yaml # CNC/GRBL settings
-│   ├── scanner.yaml # Camera and laser parameters
-│   └── processing.yaml # Mesh and toolpath settings
+│   ├── machine.yaml        # genmitsu 3020 pro / grbl settings
+│   ├── scanner.yaml        # realsense d405 parameters
+│   └── processing.yaml     # point cloud, mesh, and toolpath settings
 ├── src/
 │   ├── cnc/
-│   │   ├── grbl.py # GRBL serial communication
-│   │   └── motion.py # Scan patterns and path planning
+│   │   └── grbl.py         # grbl 1.1 serial communication
 │   ├── scanner/
-│   │   ├── camera.py # Pi Camera capture
-│   │   ├── laser.py # Laser line detection
-│   │   └── triangulation.py
+│   │   └── capture.py      # realsense d405 depth capture
 │   ├── processing/
-│   │   ├── pointcloud.py # Point cloud operations
-│   │   ├── mesh.py # Surface reconstruction
-│   │   └── toolpath.py # OpenCAMLib wrapper
+│   │   ├── pointcloud.py   # point cloud operations (open3d)
+│   │   ├── mesh.py         # surface reconstruction
+│   │   └── toolpath.py     # opencamlib toolpath generation
 │   ├── gcode/
-│   │   └── writer.py # G-code generation
-│   └── pipeline.py # Main orchestration
+│   │   └── writer.py       # g-code generation
+│   └── pipeline.py         # main orchestration (all 5 stages)
 ├── scripts/
-│   ├── calibrate.py # Camera/laser calibration
-│   ├── scan.py # Run a scan job
-│   └── process.py # Process existing point cloud
+│   ├── scan.py             # run a scan job
+│   └── process.py          # process existing point cloud
 ├── tests/
-├── data/ # Output: scans, meshes, gcode
+├── data/                   # output: point clouds, meshes, gcode, bags
 └── requirements.txt
 ```
 
 ## Usage
 
-### Calibration
-```bash
-python scripts/calibrate.py --camera    # Camera intrinsics
-python scripts/calibrate.py --laser     # Laser plane fitting
-```
-
 ### Scanning
 ```bash
-python scripts/scan.py --output data/my_part
+# live capture from d405
+python scripts/scan.py -o data/scan/pointcloud.ply
+
+# record a .bag file on the pi for offline development
+python scripts/scan.py --record my_scan.bag --duration 5
+
+# replay a .bag file (no sensor needed)
+python scripts/scan.py --bag data/bags/my_scan.bag -o data/scan/pointcloud.ply
 ```
 
-### Processing
+### Processing (no hardware needed)
 ```bash
-python scripts/process.py --input data/my_part --generate-gcode
+# process existing point cloud through mesh + gcode
+python scripts/process.py --input data/scan/pointcloud.ply --output data/output
+
+# mesh only, skip gcode generation
+python scripts/process.py --input data/scan/pointcloud.ply --output data/output --mesh-only
+```
+
+### Full Pipeline
+```bash
+# run all 5 stages end to end (live capture -> cnc execution)
+python src/pipeline.py
+
+# full pipeline with .bag playback, skip cnc execution
+python src/pipeline.py --bag data/bags/my_scan.bag --skip-execute
+
+# run up to a specific stage (e.g. stop after mesh reconstruction)
+python src/pipeline.py --stage 3
+
+# dry run (generates gcode but doesn't send to cnc)
+python src/pipeline.py --dry-run
 ```
 
 ## Configuration
 
 Edit `config/machine.yaml` for your CNC setup:
 ```yaml
-serial_port: /dev/ttyUSB0
-baud_rate: 115200
+serial:
+  port: /dev/ttyUSB0
+  baud_rate: 115200
 work_envelope:
-  x: 300  # mm
+  x: 300
   y: 200
   z: 60
 ```
-
+Edit `config/scanner.yaml` for D405 capture settings:
+```yaml
+streams:
+  depth:
+    width: 640
+    height: 480
+    fps: 30
+filters:
+  temporal:
+    frames: 15
+capture:
+  clipping:
+    min_distance: 0.04
+    max_distance: 0.50
+```
 ## License
 MIT
