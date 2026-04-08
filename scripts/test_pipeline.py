@@ -131,7 +131,7 @@ def test_stage_2(pcd, show: bool = False):
     start = time.time()
 
     # voxel downsample
-    pcd_down = pcd.downsample_voxel(0.5)
+    pcd_down = pcd.downsample_voxel(0.005)
     print_pointcloud_stats(pcd_down, "after voxel downsample (0.5mm)")
 
     # outlier removal
