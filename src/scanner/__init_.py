@@ -1,3 +1,2 @@
-from .camera import Camera, CameraConfig
-from .laser import LaserDetector, LaserConfig
-from .triangulation import Triangulator, TriangulationConfig
+# scanner package — D405 depth capture
+from .capture import RealSenseCapture

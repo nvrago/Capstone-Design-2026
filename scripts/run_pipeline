@@ -1,0 +1,174 @@
+#!/usr/bin/env python3
+"""
+run_pipeline.py -- CLI entry point for the scan-to-cnc pipeline
+
+full automated run (scan through gcode, skip cnc execution):
+    python scripts/run_pipeline.py --skip-execute
+
+full run including cnc execution:
+    python scripts/run_pipeline.py
+
+capture zero reference (empty plate):
+    python scripts/run_pipeline.py --zero
+
+run with mock arc (no hardware):
+    python scripts/run_pipeline.py --mock --skip-execute
+
+skip capture, process from saved clouds:
+    python scripts/run_pipeline.py --start-stage 2 --skip-execute
+
+run only capture (debug arc movement):
+    python scripts/run_pipeline.py --end-stage 1
+
+run specific stages:
+    python scripts/run_pipeline.py --start-stage 3 --end-stage 4
+
+override arc positions:
+    python scripts/run_pipeline.py --arc-start -45 --arc-end 45 --arc-step 10
+
+use .bag recording instead of live camera:
+    python scripts/run_pipeline.py --bag data/recordings/test.bag --mock
+
+dry run (generate gcode but simulate cnc):
+    python scripts/run_pipeline.py --dry-run
+
+load config from yaml files:
+    python scripts/run_pipeline.py --config config/
+
+verbose logging:
+    python scripts/run_pipeline.py -v
+"""
+
+import sys
+import os
+import argparse
+import logging
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
+
+from pipeline import ScanPipeline, PipelineConfig
+
+
+def parse_args():
+    p = argparse.ArgumentParser(
+        description="scan-to-cnc automated pipeline",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__
+    )
+
+    # mode
+    p.add_argument("--zero", action="store_true",
+                   help="capture zero reference (empty plate) and exit")
+
+    # config
+    p.add_argument("--config", "-c", type=str, default=None,
+                   help="config directory with yaml files (optional, "
+                        "CLI args override yaml values)")
+
+    # stage control
+    p.add_argument("--start-stage", type=int, default=1,
+                   choices=[1, 2, 3, 4, 5, 6],
+                   help="first pipeline stage to run (default: 1)")
+    p.add_argument("--end-stage", type=int, default=6,
+                   choices=[1, 2, 3, 4, 5, 6],
+                   help="last pipeline stage to run (default: 6)")
+    p.add_argument("--skip-execute", action="store_true",
+                   help="stop after gcode generation (skip stage 6)")
+    p.add_argument("--dry-run", action="store_true",
+                   help="run stage 6 in simulation mode (no cnc)")
+
+    # hardware
+    p.add_argument("--mock", action="store_true",
+                   help="use mock arc controller (no ClearCore hardware)")
+    p.add_argument("--arc-port", type=str, default=None,
+                   help="serial port for ClearCore (default: /dev/ttyUSB0)")
+    p.add_argument("--cnc-port", type=str, default=None,
+                   help="serial port for GRBL CNC (default: /dev/ttyUSB1)")
+    p.add_argument("--bag", type=str, default=None,
+                   help=".bag file for camera playback instead of live D405")
+
+    # arc positions
+    p.add_argument("--arc-start", type=float, default=None,
+                   help="arc start angle in degrees (default: -60)")
+    p.add_argument("--arc-end", type=float, default=None,
+                   help="arc end angle in degrees (default: 60)")
+    p.add_argument("--arc-step", type=float, default=None,
+                   help="arc step increment in degrees (default: 15)")
+
+    # capture
+    p.add_argument("--frames", type=int, default=None,
+                   help="frames to average per position (default: 30)")
+
+    # processing
+    p.add_argument("--skip-zero", action="store_true",
+                   help="skip zero reference subtraction")
+    p.add_argument("--voxel-size", type=float, default=None,
+                   help="voxel downsample size in meters (default: 0.005)")
+    p.add_argument("--poisson-depth", type=int, default=None,
+                   help="poisson reconstruction depth (default: 8)")
+
+    # output
+    p.add_argument("--data-dir", type=str, default=None,
+                   help="data directory (default: data)")
+
+    # logging
+    p.add_argument("-v", "--verbose", action="store_true",
+                   help="enable debug logging")
+
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+
+    level = logging.DEBUG if args.verbose else logging.INFO
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    )
+
+    if args.config:
+        config = PipelineConfig.from_yaml(args.config)
+    else:
+        config = PipelineConfig()
+
+    # CLI args override yaml/defaults (only if explicitly set)
+    if args.arc_start is not None:
+        config.arc_start_deg = args.arc_start
+    if args.arc_end is not None:
+        config.arc_end_deg = args.arc_end
+    if args.arc_step is not None:
+        config.arc_step_deg = args.arc_step
+    if args.arc_port is not None:
+        config.arc_port = args.arc_port
+    if args.cnc_port is not None:
+        config.cnc_port = args.cnc_port
+    if args.frames is not None:
+        config.frames_per_position = args.frames
+    if args.voxel_size is not None:
+        config.voxel_size = args.voxel_size
+    if args.poisson_depth is not None:
+        config.poisson_depth = args.poisson_depth
+    if args.data_dir is not None:
+        config.data_dir = args.data_dir
+
+    config.use_mock_arc = args.mock
+    config.skip_zero_subtraction = args.skip_zero
+    config.bag_file = args.bag
+
+    pipe = ScanPipeline(config)
+
+    if args.zero:
+        pipe.capture_zero_reference()
+        return
+
+    pipe.run(
+        start_stage=args.start_stage,
+        end_stage=args.end_stage,
+        dry_run=args.dry_run,
+        skip_execute=args.skip_execute,
+    )
+
+
+if __name__ == "__main__":
+    main()

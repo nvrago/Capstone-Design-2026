@@ -1,0 +1,43 @@
+# systemd service for scan-to-cnc pipeline server
+#
+# install:
+#   sudo cp deploy/scantocnc.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable scantocnc
+#   sudo systemctl start scantocnc
+#
+# check status:
+#   sudo systemctl status scantocnc
+#   journalctl -u scantocnc -f
+#
+# restart after code changes:
+#   sudo systemctl restart scantocnc
+
+[Unit]
+Description=Scan-to-CNC Pipeline Server
+After=network.target
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+WorkingDirectory=/home/pi/Capstone-Design-2026
+
+# package install check, will stop server start if fails
+ExecStartPre=/bin/bash /home/pi/Capstone-Design-2026/deploy/verify_env.sh
+
+ExecStart=/home/pi/pipeline-env/bin/python src/server.py --config config/
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+# give access to USB serial devices
+SupplementaryGroups=dialout
+
+# environment
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONPATH=/home/pi/Capstone-Design-2026/src
+
+[Install]
+WantedBy=multi-user.target
