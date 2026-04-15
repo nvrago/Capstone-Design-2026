@@ -17,10 +17,6 @@ build/
 *.swp
 *.swo
 
-# Data (large files - keep structure, ignore contents)
-data/*
-!data/.gitkeep
-
 # Logs
 *.log
 logs/
