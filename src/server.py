@@ -16,7 +16,6 @@ protocol (JSON over TCP on localhost:5001):
         {"cmd": "status"}
         {"cmd": "stage", "stage": 3, "end": 5}
         {"cmd": "config", "key": "arc_step_deg", "value": 10.0}
-        {"cmd": "capture_pose", "pose_deg": 0.0, "pose_idx": 1}
 
     server to GUI:
         {"type": "status", "state": "idle"}
@@ -24,8 +23,6 @@ protocol (JSON over TCP on localhost:5001):
         {"type": "status", "state": "complete", "run_dir": "data/runs/..."}
         {"type": "status", "state": "error", "message": "no device connected"}
         {"type": "log", "level": "info", "message": "captured 12000 points"}
-        {"type": "capture_complete", "ply_path": "...", "n_points": 12345,
-         "pose_idx": 1, "pose_deg": 0.0}
 
 the GUI doesn't need to know about venvs, paths, or Python. it just
 opens a socket and sends/receives JSON lines.
@@ -38,31 +35,7 @@ import threading
 import time
 from pathlib import Path
 
-# Note: `from pipeline import ScanPipeline, PipelineConfig` is deferred
-# into the methods that actually use it. That lets the server start up
-# and service `capture_pose` even when the full ScanPipeline's deps
-# (OpenCAMLib, Open3D, etc.) aren't installed. `capture_pose` only uses
-# pyrealsense2 + numpy and is fully self-contained.
-try:
-    from pipeline import PipelineConfig
-    _SCANPIPELINE_AVAILABLE = True
-except ImportError as _scanpipe_err:
-    _SCANPIPELINE_AVAILABLE = False
-    _SCANPIPE_IMPORT_ERROR = _scanpipe_err
-
-    # Minimal stand-in so the server can still construct a default config
-    # and carry it around. `scan` / `zero` / `stage` will fail loudly when
-    # invoked, but startup + `capture_pose` work fine.
-    class PipelineConfig:  # type: ignore[no-redef]
-        def __init__(self):
-            self.use_mock_arc = False
-
-        @classmethod
-        def from_yaml(cls, path):
-            raise RuntimeError(
-                "PipelineConfig.from_yaml unavailable: "
-                f"ScanPipeline import failed ({_scanpipe_err})"
-            )
+from pipeline import ScanPipeline, PipelineConfig
 
 logger = logging.getLogger(__name__)
 
@@ -106,10 +79,7 @@ class GUIHandler(logging.Handler):
 class PipelineServer:
     def __init__(self, config: PipelineConfig = None):
         self.config = config or PipelineConfig()
-        # ScanPipeline is built lazily inside _run_pipeline/_run_zero so
-        # the server can start without OpenCAMLib/Open3D installed. The
-        # `capture_pose` flow doesn't need it at all.
-        self.pipe = None
+        self.pipe = ScanPipeline(self.config)
         self.state = "idle"
         self.current_stage = 0
         self.current_stage_name = ""
@@ -146,14 +116,6 @@ class PipelineServer:
         self._stop_requested = False
 
         try:
-            from pipeline import ScanPipeline  # deferred to avoid OCL dep at startup
-        except ImportError as e:
-            self.state = "error"
-            self._send_status(message=f"ScanPipeline unavailable: {e}")
-            logger.error(f"ScanPipeline import failed: {e}")
-            return
-
-        try:
             logging.getLogger().addHandler(self.gui_handler)
             self.gui_handler.set_client(self.client)
 
@@ -187,14 +149,6 @@ class PipelineServer:
         self.current_stage_name = "zero_capture"
 
         try:
-            from pipeline import ScanPipeline  # deferred to avoid OCL dep at startup
-        except ImportError as e:
-            self.state = "error"
-            self._send_status(message=f"ScanPipeline unavailable: {e}")
-            logger.error(f"ScanPipeline import failed: {e}")
-            return
-
-        try:
             logging.getLogger().addHandler(self.gui_handler)
             self.gui_handler.set_client(self.client)
 
@@ -208,154 +162,6 @@ class PipelineServer:
             self.state = "error"
             self._send_status(message=str(e))
         finally:
-            logging.getLogger().removeHandler(self.gui_handler)
-            self.gui_handler.set_client(None)
-
-    def _run_capture_pose(self, pose_deg: float, pose_idx: int):
-        """single-pose capture for the UI's multi-pose scan flow.
-
-        the UI is driving arc motion via the ClearCore directly (Modbus),
-        so we don't move anything here -- we just open the RealSense,
-        grab a temporally-averaged depth frame, build a point cloud,
-        save a binary PLY, and report the path back over the socket.
-
-        this path deliberately AVOIDS open3d so the server can run under
-        python 3.12 (open3d publishes no cp312 aarch64 wheel). the UI,
-        which runs under 3.11 with a working open3d install, handles all
-        ICP alignment and merging after loading the PLY we produce.
-        """
-        from pathlib import Path
-        from datetime import datetime
-        import struct
-        # Import here so the rest of server.py still runs on a dev machine
-        # without pyrealsense2 installed.
-        import pyrealsense2 as rs
-        import numpy as np
-
-        self.state = "running"
-        self.current_stage_name = f"capture_pose_{pose_idx}"
-
-        pipe = None
-        try:
-            logging.getLogger().addHandler(self.gui_handler)
-            self.gui_handler.set_client(self.client)
-
-            # Pick an output directory: reuse the pipeline's run_dir if one
-            # already exists, otherwise drop into data/poses/<timestamp>.
-            if self.pipe and getattr(self.pipe, "run_dir", None):
-                out_dir = Path(self.pipe.run_dir) / "poses"
-            else:
-                stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                out_dir = Path("data") / "poses" / stamp
-            out_dir.mkdir(parents=True, exist_ok=True)
-
-            ply_path = out_dir / f"pose_{pose_idx:03d}_{pose_deg:+07.2f}deg.ply"
-            logger.info(
-                f"capture_pose: idx={pose_idx} deg={pose_deg:+.2f} -> {ply_path}"
-            )
-
-            # ── Pipeline setup ────────────────────────────────────────────
-            W, H, FPS = 640, 480, 30
-            TEMPORAL_FRAMES = 15
-
-            pipe = rs.pipeline()
-            cfg = rs.config()
-            cfg.enable_stream(rs.stream.depth, W, H, rs.format.z16, FPS)
-            profile = pipe.start(cfg)
-
-            # High-accuracy preset for D405 if supported
-            dev = profile.get_device()
-            depth_sensor = dev.first_depth_sensor()
-            if depth_sensor.supports(rs.option.visual_preset):
-                depth_sensor.set_option(rs.option.visual_preset, 3)
-
-            # Filter chain: decimation → spatial → temporal → hole-fill
-            decimation = rs.decimation_filter()
-            decimation.set_option(rs.option.filter_magnitude, 2)
-            spatial = rs.spatial_filter()
-            spatial.set_option(rs.option.filter_magnitude, 2)
-            spatial.set_option(rs.option.filter_smooth_alpha, 0.5)
-            spatial.set_option(rs.option.filter_smooth_delta, 20)
-            temporal = rs.temporal_filter()
-            temporal.set_option(rs.option.filter_smooth_alpha, 0.4)
-            temporal.set_option(rs.option.filter_smooth_delta, 20)
-            hole_fill = rs.hole_filling_filter()
-
-            # Warm-up: auto-exposure stabilize
-            for _ in range(30):
-                pipe.wait_for_frames()
-
-            # Temporal averaging — each pass refines the estimate
-            depth_frame = None
-            for _ in range(TEMPORAL_FRAMES):
-                frames = pipe.wait_for_frames()
-                d = frames.get_depth_frame()
-                if not d:
-                    continue
-                d = decimation.process(d)
-                d = spatial.process(d)
-                d = temporal.process(d)
-                d = hole_fill.process(d)
-                depth_frame = d
-            if depth_frame is None:
-                raise RuntimeError("no valid depth frames captured")
-
-            # Convert to point cloud
-            pc = rs.pointcloud()
-            points = pc.calculate(depth_frame)
-            verts = (np.asanyarray(points.get_vertices())
-                       .view(np.float32)
-                       .reshape(-1, 3))
-
-            # Drop zero-depth points and anything outside the D405's
-            # accurate range. Matches the UI's old clipping (~4cm - 50cm).
-            z = verts[:, 2]
-            mask = (z > 0.04) & (z < 0.50)
-            verts = verts[mask]
-
-            n_points = int(verts.shape[0])
-            logger.info(f"capture_pose: {n_points} points after filtering")
-
-            # ── Write binary little-endian PLY ────────────────────────────
-            # Open3D reads this format just fine on the UI side.
-            header = (
-                "ply\n"
-                "format binary_little_endian 1.0\n"
-                f"element vertex {n_points}\n"
-                "property float x\n"
-                "property float y\n"
-                "property float z\n"
-                "end_header\n"
-            )
-            with open(ply_path, "wb") as f:
-                f.write(header.encode("ascii"))
-                f.write(verts.astype(np.float32).tobytes())
-
-            self._send({
-                "type": "capture_complete",
-                "ply_path": str(ply_path),
-                "n_points": n_points,
-                "pose_idx": pose_idx,
-                "pose_deg": pose_deg,
-            })
-            self.state = "idle"
-            self._send_status(message=f"pose {pose_idx} captured")
-
-        except Exception as e:
-            self.state = "error"
-            logger.error(f"capture_pose error: {e}", exc_info=True)
-            self._send_status(message=str(e))
-            self._send({
-                "type": "capture_failed",
-                "pose_idx": pose_idx,
-                "message": str(e),
-            })
-        finally:
-            if pipe is not None:
-                try:
-                    pipe.stop()
-                except Exception:
-                    pass
             logging.getLogger().removeHandler(self.gui_handler)
             self.gui_handler.set_client(None)
 
@@ -415,23 +221,6 @@ class PipelineServer:
                     "end_stage": end,
                     "dry_run": dry_run,
                 },
-                daemon=True,
-            )
-            self.run_thread.start()
-            self._send_status()
-
-        elif action == "capture_pose":
-            if self.state == "running":
-                self._send({"type": "error",
-                            "message": "pipeline already running"})
-                return
-
-            pose_deg = float(cmd.get("pose_deg", 0.0))
-            pose_idx = int(cmd.get("pose_idx", 0))
-
-            self.run_thread = threading.Thread(
-                target=self._run_capture_pose,
-                kwargs={"pose_deg": pose_deg, "pose_idx": pose_idx},
                 daemon=True,
             )
             self.run_thread.start()
@@ -499,7 +288,6 @@ class PipelineServer:
 
 
 def main():
-    global PORT
     import argparse
 
     p = argparse.ArgumentParser(description="pipeline server for GUI")
@@ -526,6 +314,7 @@ def main():
     if args.mock:
         config.use_mock_arc = True
 
+    global PORT
     PORT = args.port
 
     server = PipelineServer(config)
