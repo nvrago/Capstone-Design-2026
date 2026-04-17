@@ -117,7 +117,7 @@ class PipelineServer:
         """run the pipeline in a background thread."""
         self.state = "running"
         self._stop_requested = False
-
+        self.pipe = ScanPipeline(self.config)
         try:
             logging.getLogger().addHandler(self.gui_handler)
             self.gui_handler.set_client(self.client)
