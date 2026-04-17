@@ -429,6 +429,11 @@ class PipelineClient(QThread):
         mtype = msg.get("type", "")
         if mtype == "status":
             self.pipeline_state.emit(msg)
+        elif mtype == "capture_result":
+            self.capture_result.emit(msg)
+        elif mtype in ("scan_session_started", "scan_session_ended"):
+            # Server ack — nothing for the UI to do. Quietly acknowledge.
+            pass
         elif mtype == "log":
             level = msg.get("level", "info").upper()
             text = msg.get("message", "")
@@ -1196,6 +1201,10 @@ class ScanToMillUI(QMainWindow):
         # Also halt any local scan worker
         if self._scan_worker and self._scan_worker.isRunning():
             self._scan_worker.stop()
+        if hasattr(self, "_stepped_worker") and self._stepped_worker.isRunning():
+            self._stepped_worker.stop()
+        if hasattr(self, "_pipeline"):
+            self._pipeline.send_cmd(cmd="end_scan_session")
         self._reset_scan_ui()
         self.progress_bar.setFormat("%p%  —  E-STOP")
         self.lbl_stage.setText("E-STOP")
@@ -1449,6 +1458,11 @@ class ScanToMillUI(QMainWindow):
 
         self._log("[SYS] Scan started — homing first, then stepped scan.")
 
+        # Tell server.py to prepare a fresh pipeline for this scan session.
+        # Even if the camera is offline, sending this is harmless; it just
+        # won't reach anyone.
+        self._pipeline.send_cmd(cmd="start_scan_session")
+
         # Phase: HOMING
         self._scan_phase = "homing"
         self._scan_running = True
@@ -1545,6 +1559,7 @@ class ScanToMillUI(QMainWindow):
     def _on_stepped_done(self):
         self._scan_phase = "complete"
         self._log("[STEP] Stepped scan complete.")
+        ]self._pipeline.send_cmd(cmd="end_scan_session")
         self._reset_scan_ui()
         self.progress_bar.setValue(100)
         self.progress_bar.setFormat("COMPLETE")
@@ -1554,6 +1569,7 @@ class ScanToMillUI(QMainWindow):
     def _on_stepped_err(self, msg: str):
         self._scan_phase = "idle"
         self._log(msg)
+        self._pipeline.send_cmd(cmd="end_scan_session")
         self._reset_scan_ui()
         self.progress_bar.setFormat("%p%  —  ERROR")
         self.lbl_stage.setText("ERROR")
@@ -1564,7 +1580,8 @@ class ScanToMillUI(QMainWindow):
             self._scan_worker.stop()
         if hasattr(self, "_stepped_worker") and self._stepped_worker.isRunning():
             self._stepped_worker.stop()
-        self._modbus.send_command(CCMD_STOP)
+        self._modbus.send_command(CCMD_STOP
+        self._pipeline.send_cmd(cmd="end_scan_session")
         self._reset_scan_ui()
         self.progress_bar.setValue(0)
         self.progress_bar.setFormat("%p%  —  IDLE")
