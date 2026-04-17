@@ -398,6 +398,7 @@ class PipelineServer:
 
 
 def main():
+    global PORT
     import argparse
 
     p = argparse.ArgumentParser(description="pipeline server for GUI")
