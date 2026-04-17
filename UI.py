@@ -794,7 +794,8 @@ class ClearCoreModbus(QThread):
 # the main window.
 
 # Fill in after measuring. See the calc above.
-STEPS_PER_DEGREE = 17.78   # <<< PLACEHOLDER — update after confirming drive ratio
+STEPS_PER_REV = 6400
+STEPS_PER_DEGREE = STEPS_PER_REV / 360   # direct drive: motor shaft = arc pivot
 
 # Velocity/accel for stepped moves (slower = cleaner captures, less ringing)
 STEP_VEL_SPS   = 2000    # matches SCAN_VEL_SPS on the ClearCore
@@ -1003,6 +1004,7 @@ class ScanToMillUI(QMainWindow):
         self.showMaximized()
         self._scan_worker = None
         self._scan_running = False
+        self._scan_phase = "idle"
         self._point_count = 0
         self._build_ui()
         self._start_clock()
@@ -1063,6 +1065,35 @@ class ScanToMillUI(QMainWindow):
             self._log(f"[PIPE] !! ERROR: {state.get('message', '(no detail)')}")
 
         self._pipeline_last_state = state
+
+
+    def _transition_to_stepped_scan(self):
+        """Called on the HOMED edge. Halts the firmware's own sweep and
+        launches the Python-side stepped worker."""
+        self._scan_phase = "scanning"
+
+        # Halt whatever the firmware is doing (it was about to drive toward the
+        # far limit as part of its built-in sequence)
+        self._modbus.send_command(CCMD_STOP)
+
+        # Update progress bar display
+        self.progress_bar.setFormat("%p%  —  SCANNING")
+        self.lbl_stage.setText("SCANNING")
+        self.progress_bar.setValue(0)
+
+        # Launch the stepped worker
+        angles = [0, 45, 90, 135, 180]
+        self._stepped_worker = SteppedScanWorker(
+            modbus=self._modbus,
+            get_status_fn=lambda: self._modbus_last_status,
+            angles_deg=angles,
+        )
+        self._stepped_worker.capture_requested.connect(self._on_capture_requested)
+        self._stepped_worker.progress.connect(self._on_stepped_progress)
+        self._stepped_worker.log_message.connect(self._log)
+        self._stepped_worker.finished_ok.connect(self._on_stepped_done)
+        self._stepped_worker.finished_err.connect(self._on_stepped_err)
+        self._stepped_worker.start()
     # ── Modbus TCP link to ClearCore ──────────────────────────────────────────
     def _init_modbus(self):
         self._modbus = ClearCoreModbus(
@@ -1099,6 +1130,12 @@ class ScanToMillUI(QMainWindow):
         if status.get("fault") and not prev.get("fault"):
             self._log("[MODBUS] !! FAULT latched")
 
+        # Detect home-complete during the HOMING phase of a stepped scan
+        if (self._scan_phase == "homing"
+            and status.get("homed")
+            and not prev.get("homed")):
+            self._log("[SYS] Homing complete — starting stepped scan.")
+            self._transition_to_stepped_scan()
         # E-stop edge handling
         estop_now = status.get("estop", False)
         if estop_now and not self._estop_active:
@@ -1111,6 +1148,7 @@ class ScanToMillUI(QMainWindow):
         self._modbus_last_status = status
 
     def _on_estop_engaged(self):
+        self._scan_phase = "idle"
         self._log("[SYS] !! EMERGENCY STOP ENGAGED !!")
         # Force geometry in case resizeEvent hasn't sized it yet
         w = int(self.width() * 0.6)
@@ -1370,31 +1408,100 @@ class ScanToMillUI(QMainWindow):
 
     # ── Scan Actions ──────────────────────────────────────────────────────────
     def _on_start(self):
+        if hasattr(self, "_stepped_worker") and self._stepped_worker.isRunning():
+            self._log("[STEP] Already running.")
+            return
+
+        self._log("[SYS] Scan started — homing first, then stepped scan.")
+
+        # Phase: HOMING
+        self._scan_phase = "homing"
         self._scan_running = True
         self.btn_start.setEnabled(False)
         self.btn_stop.setEnabled(True)
         self.btn_export.setEnabled(False)
-        self.progress_bar.setFormat("%p%  —  SCANNING")
-        self.lbl_stage.setText("SCANNING")
+
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat("HOMING...")   # no % while homing
+        self.lbl_stage.setText("HOMING")
+        self.lbl_elapsed.setText("00:00")
+        self.lbl_remaining.setText("—")
+        self.lbl_pts_stat.setText("—")
+
+        # Start elapsed timer now (homing time counts as part of the scan)
         self._scan_elapsed = 0
         self._scan_timer = QTimer()
         self._scan_timer.timeout.connect(self._tick_elapsed)
         self._scan_timer.start(1000)
 
-        self._scan_worker = ScanWorker()
-        self._scan_worker.progress.connect(self._on_progress)
-        self._scan_worker.point_count.connect(self._on_points)
-        self._scan_worker.log_message.connect(self._log)
-        self._scan_worker.finished.connect(self._on_scan_done)
-        self._scan_worker.start()
-
-        # Tell the ClearCore to begin its scan motion profile
+        # Fire the firmware's home→scan→return; we'll interrupt it once HOMED flips high
         self._modbus.send_command(CCMD_RUN_1)
 
+    def _on_stepped_scan(self):
+        """Run a stepped scan: 0, 45, 90, 135, 180 degrees, pausing at each."""
+        if hasattr(self, "_stepped_worker") and self._stepped_worker.isRunning():
+            self._log("[STEP] Already running.")
+            return
 
+        angles = [0, 45, 90, 135, 180]
+        self._log(f"[STEP] Stepped scan requested: {angles} deg")
+
+        self.btn_start.setEnabled(False)
+        self.btn_stop.setEnabled(True)
+        self.progress_bar.setFormat("%p%  —  STEPPED SCAN")
+        self.lbl_stage.setText("STEPPED")
+        self.progress_bar.setValue(0)
+
+        self._stepped_worker = SteppedScanWorker(
+            modbus=self._modbus,
+            get_status_fn=lambda: self._modbus_last_status,
+            angles_deg=angles,
+        )
+        self._stepped_worker.capture_requested.connect(self._on_capture_requested)
+        self._stepped_worker.progress.connect(self._on_stepped_progress)
+        self._stepped_worker.log_message.connect(self._log)
+        self._stepped_worker.finished_ok.connect(self._on_stepped_done)
+        self._stepped_worker.finished_err.connect(self._on_stepped_err)
+        self._stepped_worker.start()
+
+    def _on_capture_requested(self, idx: int, angle: float, target_steps: int):
+        """Called on the main thread when the worker reaches a capture point."""
+        self._log(f"[CAPTURE] #{idx + 1} at {angle} deg (pos={target_steps} steps)")
+        # TODO: trigger camera. For now, simulate with a 500ms fake capture so
+        # you can see the full loop work before the camera is wired in.
+        QTimer.singleShot(500, lambda: self._stepped_worker.capture_complete_event.set())
+
+        # Eventually, this is where you'd fire a pipeline command:
+        # self._pipeline.send_cmd(cmd="capture_frame", index=idx, angle_deg=angle)
+        # and the server.py response (or the D405 capture callback) would set
+        # the event.
+
+    def _on_stepped_progress(self, done: int, total: int):
+        pct = int(round(100 * done / total))
+        self.progress_bar.setValue(pct)
+
+    def _on_stepped_done(self):
+        self._scan_phase = "complete"
+        self._log("[STEP] Stepped scan complete.")
+        self._reset_scan_ui()
+        self.progress_bar.setValue(100)
+        self.progress_bar.setFormat("COMPLETE")
+        self.lbl_stage.setText("COMPLETE")
+        self.btn_export.setEnabled(True)
+
+    def _on_stepped_err(self, msg: str):
+        self._scan_phase = "idle"
+        self._log(msg)
+        self._reset_scan_ui()
+        self.progress_bar.setFormat("%p%  —  ERROR")
+        self.lbl_stage.setText("ERROR")
+        
     def _on_stop(self):
+        self._scan_phase = "idle"
         if self._scan_worker:
             self._scan_worker.stop()
+        if hasattr(self, "_stepped_worker") and self._stepped_worker.isRunning():
+            self._stepped_worker.stop()
         self._modbus.send_command(CCMD_STOP)
         self._reset_scan_ui()
         self.progress_bar.setValue(0)
