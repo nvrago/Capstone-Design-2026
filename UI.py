@@ -785,7 +785,176 @@ class ClearCoreModbus(QThread):
         except Exception as e:
             self.error.emit(f"[MODBUS] msg read err: {e}")
 
+# ── Stepped scan worker ──────────────────────────────────────────────────────
+#
+# Drives the carriage to a list of angular stops, waiting at each one for
+# the camera to capture a frame. The angles are converted to absolute
+# step positions using STEPS_PER_DEGREE. Motion-complete detection polls
+# the ClearCore's MOVING status bit via the shared last-status dict on
+# the main window.
 
+# Fill in after measuring. See the calc above.
+STEPS_PER_DEGREE = 17.78   # <<< PLACEHOLDER — update after confirming drive ratio
+
+# Velocity/accel for stepped moves (slower = cleaner captures, less ringing)
+STEP_VEL_SPS   = 2000    # matches SCAN_VEL_SPS on the ClearCore
+STEP_ACCEL_SPSPS = 20000
+
+
+class SteppedScanWorker(QThread):
+    """Drive the carriage to a list of angles, pausing for a capture at each.
+
+    The worker runs on its own thread. It sends CCMD_MOVE via the shared
+    ClearCoreModbus client, then polls `get_status_fn()` until the motion
+    completes. At each stop it emits capture_requested and waits for
+    capture_complete_event to be set by the main thread (or the pipeline).
+    """
+
+    capture_requested = pyqtSignal(int, float, int)   # (index, angle_deg, target_steps)
+    progress          = pyqtSignal(int, int)          # (completed, total)
+    log_message       = pyqtSignal(str)
+    finished_ok       = pyqtSignal()
+    finished_err      = pyqtSignal(str)
+
+    # Timing knobs
+    MOVE_START_GRACE_MS   = 300    # how long to wait for MOVING bit to go high
+    MOVE_POLL_INTERVAL_MS = 50     # how often to check motion-complete
+    MOVE_TIMEOUT_SEC      = 30     # hard cap on any single move
+    SETTLE_MS             = 300    # post-move dwell before capture
+    CAPTURE_TIMEOUT_SEC   = 10     # how long to wait for main thread to signal done
+
+    def __init__(self, modbus, get_status_fn, angles_deg,
+                 steps_per_degree: float = STEPS_PER_DEGREE,
+                 return_home_on_finish: bool = True, parent=None):
+        super().__init__(parent)
+        self._modbus = modbus
+        self._get_status = get_status_fn        # callable returning last status dict
+        self._angles = list(angles_deg)
+        self._spd = float(steps_per_degree)
+        self._return_home = return_home_on_finish
+        self._stopped = False
+
+        self.capture_complete_event = threading.Event()
+
+    def stop(self):
+        self._stopped = True
+        self.capture_complete_event.set()   # unblock any waiting capture
+
+    def run(self):
+        try:
+            total = len(self._angles)
+            self.log_message.emit(
+                f"[STEP] Starting stepped scan: {total} stops at "
+                f"{self._angles} deg ({self._spd:.2f} steps/deg)"
+            )
+
+            for idx, angle in enumerate(self._angles):
+                if self._stopped:
+                    self.log_message.emit("[STEP] Aborted by user.")
+                    return
+
+                target_steps = int(round(angle * self._spd))
+                self.log_message.emit(
+                    f"[STEP] Stop {idx + 1}/{total}: moving to "
+                    f"{angle} deg ({target_steps} steps)"
+                )
+
+                # 1. Command the move
+                self._modbus.send_command(
+                    CCMD_MOVE,
+                    target_posn=target_steps,
+                    velocity=STEP_VEL_SPS,
+                    accel=STEP_ACCEL_SPSPS,
+                )
+
+                # 2. Wait for motion to start (MOVING bit goes high) and then
+                #    finish (MOVING bit goes low), with a hard timeout.
+                if not self._wait_for_move_complete():
+                    self.finished_err.emit(
+                        f"[STEP] Move to {angle} deg timed out or faulted"
+                    )
+                    return
+
+                if self._stopped:
+                    return
+
+                # 3. Settle time before capture
+                self.msleep(self.SETTLE_MS)
+
+                # 4. Request a capture and wait for the main thread to complete it
+                self.capture_complete_event.clear()
+                self.capture_requested.emit(idx, angle, target_steps)
+                self.log_message.emit(
+                    f"[STEP] At {angle} deg — awaiting capture..."
+                )
+                got_it = self.capture_complete_event.wait(
+                    timeout=self.CAPTURE_TIMEOUT_SEC
+                )
+                if self._stopped:
+                    return
+                if not got_it:
+                    self.log_message.emit(
+                        f"[STEP] Capture at {angle} deg timed out — continuing"
+                    )
+                else:
+                    self.log_message.emit(f"[STEP] Capture {idx + 1} done.")
+
+                self.progress.emit(idx + 1, total)
+
+            # Optional return to home
+            if self._return_home and not self._stopped:
+                self.log_message.emit("[STEP] Returning to home (0 deg).")
+                self._modbus.send_command(
+                    CCMD_MOVE, target_posn=0,
+                    velocity=STEP_VEL_SPS, accel=STEP_ACCEL_SPSPS,
+                )
+                self._wait_for_move_complete()
+
+            self.finished_ok.emit()
+
+        except Exception as e:
+            self.finished_err.emit(f"[STEP] Worker crashed: {e}")
+
+    # ── helpers ──────────────────────────────────────────────────────────
+    def _wait_for_move_complete(self) -> bool:
+        """Block until the ClearCore reports motion complete. Returns False
+        on timeout, fault, e-stop, or user abort."""
+        import time as _t
+        t0 = _t.monotonic()
+
+        # First phase: wait for moving bit to assert (motion actually started).
+        # If the bit never asserts within the grace window, assume the move
+        # was effectively instantaneous (already at target) and move on.
+        phase1_deadline = t0 + (self.MOVE_START_GRACE_MS / 1000.0)
+        saw_motion = False
+        while _t.monotonic() < phase1_deadline:
+            if self._stopped:
+                return False
+            st = self._get_status() or {}
+            if st.get("fault") or st.get("estop"):
+                return False
+            if st.get("moving"):
+                saw_motion = True
+                break
+            self.msleep(self.MOVE_POLL_INTERVAL_MS)
+
+        if not saw_motion:
+            # Target was already the current position — that's fine.
+            return True
+
+        # Second phase: wait for moving bit to de-assert (motion complete).
+        while True:
+            if self._stopped:
+                return False
+            if _t.monotonic() - t0 > self.MOVE_TIMEOUT_SEC:
+                return False
+            st = self._get_status() or {}
+            if st.get("fault") or st.get("estop"):
+                return False
+            if not st.get("moving", False):
+                return True
+            self.msleep(self.MOVE_POLL_INTERVAL_MS)
+            
 # ── Worker thread for fake scan progress ─────────────────────────────────────
 class ScanWorker(QThread):
     progress = pyqtSignal(int)
