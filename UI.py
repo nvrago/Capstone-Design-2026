@@ -795,7 +795,7 @@ class ClearCoreModbus(QThread):
 # the main window.
 
 # Fill in after measuring. See the calc above.
-STEPS_PER_REV = 12000
+STEPS_PER_REV = 24000
 STEPS_PER_DEGREE = STEPS_PER_REV / 360   # direct drive: motor shaft = arc pivot
 
 # Velocity/accel for stepped moves (slower = cleaner captures, less ringing)
