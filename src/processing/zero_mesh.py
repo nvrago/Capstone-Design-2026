@@ -147,17 +147,22 @@ def clip_below_reference(
 
     ref_points = np.asarray(reference.points)
     max_z = np.max(ref_points[:, 2])
-    clip_z = max_z + buffer_m
+    # subtract buffer so we clip slightly into the plate rather than above it
+    clip_z = max_z - buffer_m
 
     scan_points = np.asarray(scan.points)
-    above_mask = scan_points[:, 2] > clip_z
-    above_indices = np.where(above_mask)[0].tolist()
 
-    clipped = scan.select_by_index(above_indices)
+    # the D405 looks down, so Z increases with distance from camera.
+    # the plate is far (high Z), the object sticks up toward camera (lower Z).
+    # keep points that are closer to the camera than the plate surface.
+    object_mask = scan_points[:, 2] < clip_z
+    object_indices = np.where(object_mask)[0].tolist()
+
+    clipped = scan.select_by_index(object_indices)
     n_removed = len(scan.points) - len(clipped.points)
 
     logger.info(f"z-clip: plate max Z={max_z:.4f}m, threshold={clip_z:.4f}m, "
-                f"removed {n_removed} points, {len(clipped.points)} remain")
+                f"removed {n_removed} points below plate, {len(clipped.points)} remain")
 
     return clipped
 
