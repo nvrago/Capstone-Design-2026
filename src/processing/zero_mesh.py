@@ -174,7 +174,7 @@ def apply_zero_subtraction(
     reference_path: Path = ZERO_CLOUD_PATH,
     distance_threshold: float = 0.003,
     z_clip: bool = True,
-    z_clip_buffer: float = 0.001
+    z_clip_buffer: float = 0.003
 ) -> o3d.geometry.PointCloud:
     """
     load reference and apply both subtraction methods in one call.
