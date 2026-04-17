@@ -168,7 +168,7 @@ class MeshReconstructor:
         self.last_densities = np.asarray(densities)
 
         # trim low-density vertices (poisson artifacts at edges)
-        threshold = np.quantile(self.last_densities, 0.25)
+        threshold = np.quantile(self.last_densities, 0.20)
         vertices_to_remove = self.last_densities < threshold
         mesh.remove_vertices_by_mask(vertices_to_remove)
         logger.info(f"density trim: removed {vertices_to_remove.sum()} low-confidence vertices")
