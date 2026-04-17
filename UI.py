@@ -1559,7 +1559,7 @@ class ScanToMillUI(QMainWindow):
     def _on_stepped_done(self):
         self._scan_phase = "complete"
         self._log("[STEP] Stepped scan complete.")
-        ]self._pipeline.send_cmd(cmd="end_scan_session")
+        self._pipeline.send_cmd(cmd="end_scan_session")
         self._reset_scan_ui()
         self.progress_bar.setValue(100)
         self.progress_bar.setFormat("COMPLETE")
