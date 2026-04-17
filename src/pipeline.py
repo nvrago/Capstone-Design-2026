@@ -295,7 +295,95 @@ class ScanPipeline:
         logger.info("hardware released")
 
     # stage 1: capture
+    # ── interactive capture (for UI-driven stepped scans) ──────────────────
 
+    def _setup_scanner_only(self):
+        """Start just the RealSense scanner. Used by interactive capture,
+        where arc motion is driven externally (Pi + ClearCore via UI)."""
+        if self.scanner is not None:
+            return  # already up
+        self.scanner = RealSenseCapture(
+            width=self.config.capture_width,
+            height=self.config.capture_height,
+            fps=self.config.capture_fps,
+            temporal_frames=self.config.frames_per_position,
+            decimation_magnitude=self.config.decimation_magnitude,
+            bag_file=self.config.bag_file,
+        )
+        self.scanner.start()
+        logger.info("scanner initialized (interactive mode)")
+
+    def capture_frame(
+        self,
+        index: int,
+        angle_deg: float,
+        target_steps: int = 0,
+    ) -> dict:
+        """Capture a single depth frame at the current carriage position.
+
+        Designed to be called from server.py in response to a capture_frame
+        command from the UI during a stepped scan. The carriage motion is
+        driven externally by the UI/ClearCore; this method only handles the
+        camera side.
+
+        Saves the clipped cloud to position_clouds/pos_<angle>.ply and appends
+        (angle, pcd) to self.position_clouds so later pipeline stages
+        (register/mesh/toolpath) can consume the accumulated scan.
+
+        Raises on hard failures (scanner down, empty frame). The UI's lenient
+        policy will log + skip those angles.
+        """
+        # Lazy scanner start on first capture
+        self._setup_scanner_only()
+
+        # Lazy run_dir creation — first capture in an interactive session
+        # owns the run directory. Subsequent captures append to it.
+        if self.run_dir is None:
+            self._create_run_dir()
+
+        logger.info(f"capture_frame idx={index} angle={angle_deg:.1f} "
+                    f"steps={target_steps}")
+
+        pcd = self.scanner.capture()
+        if pcd is None or len(pcd.points) == 0:
+            raise RuntimeError(f"empty capture at {angle_deg:.1f} deg")
+
+        # Same depth clip as stage_1_capture uses — keep behavior consistent
+        bbox = o3d.geometry.AxisAlignedBoundingBox(
+            min_bound=np.array([-10.0, -10.0, 0.0]),
+            max_bound=np.array([10.0, 10.0, self.config.depth_clip_max_m]),
+        )
+        pcd = pcd.crop(bbox)
+
+        # Save using the same filename convention as batch mode so later
+        # stages don't have to care whether captures came from stage_1 or
+        # from interactive capture_frame calls.
+        rel_path = f"position_clouds/pos_{angle_deg:.1f}.ply"
+        saved = self._save(pcd, rel_path)
+
+        self.position_clouds.append((float(angle_deg), pcd))
+        logger.info(f"captured {len(pcd.points)} points at {angle_deg:.1f} deg")
+
+        return {
+            "point_count": len(pcd.points),
+            "path": str(saved),
+            "total_captures_in_run": len(self.position_clouds),
+        }
+
+    def end_interactive_capture(self):
+        """Release the scanner after an interactive capture session.
+        Optional — the UI can call this when the stepped scan completes
+        to free USB resources. If not called, scanner stays up until
+        the server exits."""
+        if self.scanner is None:
+            return
+        try:
+            self.scanner.stop()
+        except Exception as e:
+            logger.warning(f"scanner stop failed: {e}")
+        self.scanner = None
+        logger.info("interactive capture session ended")
+    
     def stage_1_capture(self):
         """
         capture point clouds at each arc position.
