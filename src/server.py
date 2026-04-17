@@ -456,6 +456,7 @@ class PipelineServer:
 
 
 def main():
+    global PORT
     import argparse
 
     p = argparse.ArgumentParser(description="pipeline server for GUI")
@@ -482,7 +483,6 @@ def main():
     if args.mock:
         config.use_mock_arc = True
 
-    global PORT
     PORT = args.port
 
     server = PipelineServer(config)
