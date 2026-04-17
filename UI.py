@@ -266,6 +266,7 @@ class PipelineClient(QThread):
 
     connected      = pyqtSignal(bool)   # True on open, False on close/error
     pipeline_state = pyqtSignal(dict)   # {"state": "running", "stage": 2, ...}
+    capture_result     = pyqtSignal(dict)    # <-- add this
     log_message    = pyqtSignal(str)    # log lines forwarded from the server
     error          = pyqtSignal(str)
 
@@ -432,6 +433,8 @@ class PipelineClient(QThread):
             level = msg.get("level", "info").upper()
             text = msg.get("message", "")
             self.log_message.emit(f"[PIPE/{level}] {text}")
+        elif mtype == "capture_result":       # <-- add this branch
+            self.capture_result.emit(msg)
         elif mtype == "error":
             self.error.emit(f"[PIPE] {msg.get('message', '')}")
         elif mtype == "config_updated":
@@ -1011,6 +1014,8 @@ class ScanToMillUI(QMainWindow):
         self._start_clock()
         self._init_modbus()
         self._init_pipeline()
+        self._capture_request_id = 0       # monotonic request ID generator
+        self._capture_in_flight = None     # the req_id we're waiting on, or None
 
     # ── Pipeline server link ──────────────────────────────────────────────────
     def _init_pipeline(self):
@@ -1020,6 +1025,7 @@ class ScanToMillUI(QMainWindow):
         )
         self._pipeline.connected.connect(self._on_pipeline_connected)
         self._pipeline.pipeline_state.connect(self._on_pipeline_state)
+        self._pipeline.capture_result.connect(self._on_capture_result)
         self._pipeline.log_message.connect(self._log)
         self._pipeline.error.connect(self._log)
         self._pipeline_last_state = {}
@@ -1095,6 +1101,34 @@ class ScanToMillUI(QMainWindow):
         self._stepped_worker.finished_ok.connect(self._on_stepped_done)
         self._stepped_worker.finished_err.connect(self._on_stepped_err)
         self._stepped_worker.start()
+
+    def _on_capture_result(self, msg: dict):
+        """Called on the main thread when a capture_result arrives from the
+        pipeline server. Matches it against the in-flight request and releases
+        the stepped worker."""
+        req_id = msg.get("request_id")
+        idx = msg.get("index")
+        angle = msg.get("angle_deg")
+        ok = msg.get("ok", False)
+
+        # Only respond to the capture we're actually waiting for. Stale responses
+        # (e.g. a previous scan's late reply) get dropped.
+        if req_id != self._capture_in_flight:
+            self._log(f"[CAPTURE] Dropping stale result req={req_id} "
+                      f"(waiting on {self._capture_in_flight})")
+            return
+
+        self._capture_in_flight = None
+
+        if ok:
+            pc = msg.get("point_count", "?")
+            self._log(f"[CAPTURE] #{idx + 1} at {angle} deg OK ({pc} pts)")
+            # Release the stepped worker to move on
+            if hasattr(self, "_stepped_worker"):
+                self._stepped_worker.capture_complete_event.set()
+        else:
+            err = msg.get("error", "(no detail)")
+            self._capture_fail(idx, angle, err)
     # ── Modbus TCP link to ClearCore ──────────────────────────────────────────
     def _init_modbus(self):
         self._modbus = ClearCoreModbus(
@@ -1466,16 +1500,43 @@ class ScanToMillUI(QMainWindow):
         self._stepped_worker.start()
 
     def _on_capture_requested(self, idx: int, angle: float, target_steps: int):
-        """Called on the main thread when the worker reaches a capture point."""
+        """Called on the main thread when the worker reaches a capture point.
+        Dispatches a capture_frame command to the pipeline server and waits
+        for the matching capture_result."""
         self._log(f"[CAPTURE] #{idx + 1} at {angle} deg (pos={target_steps} steps)")
-        # TODO: trigger camera. For now, simulate with a 500ms fake capture so
-        # you can see the full loop work before the camera is wired in.
-        QTimer.singleShot(500, lambda: self._stepped_worker.capture_complete_event.set())
 
-        # Eventually, this is where you'd fire a pipeline command:
-        # self._pipeline.send_cmd(cmd="capture_frame", index=idx, angle_deg=angle)
-        # and the server.py response (or the D405 capture callback) would set
-        # the event.
+        # Can't capture if the pipeline server isn't connected.
+        if not self._pipeline_last_state and not getattr(self, "_pipeline", None):
+            self._log("[CAPTURE] !! Pipeline server not connected — aborting scan.")
+            self._capture_fail(idx, angle, "pipeline server not connected")
+            return
+        # Also guard on the socket state via the connected status label — this is
+        # approximate but the worker has a 10s timeout as a backstop.
+        if self.lbl_camera_status.text() != "● CAMERA ONLINE":
+            self._log("[CAPTURE] !! Pipeline offline — aborting scan.")
+            self._capture_fail(idx, angle, "pipeline offline")
+            return
+
+        # Assign a fresh request ID
+        self._capture_request_id += 1
+        self._capture_in_flight = self._capture_request_id
+
+        self._pipeline.send_cmd(
+            cmd="capture_frame",
+            request_id=self._capture_request_id,
+            index=idx,
+            angle_deg=angle,
+            target_steps=target_steps,
+        )
+
+    def _capture_fail(self, idx: int, angle: float, reason: str):
+        """Mark the current scan as failed and abort."""
+        self._log(f"[CAPTURE] FAIL at {angle} deg: {reason}")
+        self._capture_in_flight = None
+        if hasattr(self, "_stepped_worker") and self._stepped_worker.isRunning():
+            # Stop the worker — its capture_complete_event never gets set, so it
+            #would otherwise sit blocked on wait() for 10 seconds.
+            self._stepped_worker.stop()
 
     def _on_stepped_progress(self, done: int, total: int):
         pct = int(round(100 * done / total))
