@@ -6,6 +6,7 @@ Requires: PyQt6, pyvistaqt, pyvista, numpy
 
 import sys
 import queue
+import threading
 import numpy as np
 import os
 os.environ["QT_QPA_PLATFORM"] = "xcb"
