@@ -8,6 +8,9 @@ import sys
 import queue
 import numpy as np
 import os
+os.environ["QT_QPA_PLATFORM"] = "xcb"
+os.environ["LIBGL_ALWAYS_SOFTWARE"] = "1"           # <-- add
+os.environ["VTK_DISABLE_OPENGL_RENDER_TIMER"] = "1" # <-- add
 # Force Qt to use the X11 (xcb) platform plugin instead of Wayland.
 # VTK's rendering code talks directly to X11 and gets BadWindow errors
 # when Qt is using the wayland backend on Raspberry Pi OS. xcb works
@@ -1091,7 +1094,7 @@ class ScanToMillUI(QMainWindow):
 # ── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     pv.set_plot_theme("dark")
-    pv.global_theme.multi_samples = 1        # <-- add this
+    pv.global_theme.multi_samples = 0   # was 1 — must be 0 on Pi 5 V3D/llvmpipe
     pv.global_theme.smooth_shading = False
     pv.global_theme.allow_empty_mesh = True   # placeholder cloud has 0 points
     app = QApplication(sys.argv)
