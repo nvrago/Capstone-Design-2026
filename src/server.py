@@ -173,29 +173,33 @@ class PipelineServer:
 
         the UI is driving arc motion via the ClearCore directly (Modbus),
         so we don't move anything here -- we just open the RealSense,
-        grab a temporally-averaged frame, save a .ply into the active run
-        directory, and report the path back over the socket.
+        grab a temporally-averaged depth frame, build a point cloud,
+        save a binary PLY, and report the path back over the socket.
 
-        keeping this separate from the full `scan` pipeline means the GUI
-        can stitch together an arbitrary number of poses without having
-        to pretend each one is a full stage run.
+        this path deliberately AVOIDS open3d so the server can run under
+        python 3.12 (open3d publishes no cp312 aarch64 wheel). the UI,
+        which runs under 3.11 with a working open3d install, handles all
+        ICP alignment and merging after loading the PLY we produce.
         """
         from pathlib import Path
         from datetime import datetime
-        # Import here so the rest of server.py still works on a dev machine
+        import struct
+        # Import here so the rest of server.py still runs on a dev machine
         # without pyrealsense2 installed.
-        from scanner.capture import RealSenseCapture
+        import pyrealsense2 as rs
+        import numpy as np
 
         self.state = "running"
         self.current_stage_name = f"capture_pose_{pose_idx}"
 
+        pipe = None
         try:
             logging.getLogger().addHandler(self.gui_handler)
             self.gui_handler.set_client(self.client)
 
             # Pick an output directory: reuse the pipeline's run_dir if one
             # already exists, otherwise drop into data/poses/<timestamp>.
-            if self.pipe and self.pipe.run_dir:
+            if self.pipe and getattr(self.pipe, "run_dir", None):
                 out_dir = Path(self.pipe.run_dir) / "poses"
             else:
                 stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -203,19 +207,86 @@ class PipelineServer:
             out_dir.mkdir(parents=True, exist_ok=True)
 
             ply_path = out_dir / f"pose_{pose_idx:03d}_{pose_deg:+07.2f}deg.ply"
-
             logger.info(
                 f"capture_pose: idx={pose_idx} deg={pose_deg:+.2f} -> {ply_path}"
             )
 
-            cam = RealSenseCapture(width=640, height=480, fps=30,
-                                   temporal_frames=15)
-            try:
-                cam.start()
-                pcd = cam.capture(output_path=str(ply_path))
-                n_points = len(pcd.points)
-            finally:
-                cam.stop()
+            # ── Pipeline setup ────────────────────────────────────────────
+            W, H, FPS = 640, 480, 30
+            TEMPORAL_FRAMES = 15
+
+            pipe = rs.pipeline()
+            cfg = rs.config()
+            cfg.enable_stream(rs.stream.depth, W, H, rs.format.z16, FPS)
+            profile = pipe.start(cfg)
+
+            # High-accuracy preset for D405 if supported
+            dev = profile.get_device()
+            depth_sensor = dev.first_depth_sensor()
+            if depth_sensor.supports(rs.option.visual_preset):
+                depth_sensor.set_option(rs.option.visual_preset, 3)
+
+            # Filter chain: decimation → spatial → temporal → hole-fill
+            decimation = rs.decimation_filter()
+            decimation.set_option(rs.option.filter_magnitude, 2)
+            spatial = rs.spatial_filter()
+            spatial.set_option(rs.option.filter_magnitude, 2)
+            spatial.set_option(rs.option.filter_smooth_alpha, 0.5)
+            spatial.set_option(rs.option.filter_smooth_delta, 20)
+            temporal = rs.temporal_filter()
+            temporal.set_option(rs.option.filter_smooth_alpha, 0.4)
+            temporal.set_option(rs.option.filter_smooth_delta, 20)
+            hole_fill = rs.hole_filling_filter()
+
+            # Warm-up: auto-exposure stabilize
+            for _ in range(30):
+                pipe.wait_for_frames()
+
+            # Temporal averaging — each pass refines the estimate
+            depth_frame = None
+            for _ in range(TEMPORAL_FRAMES):
+                frames = pipe.wait_for_frames()
+                d = frames.get_depth_frame()
+                if not d:
+                    continue
+                d = decimation.process(d)
+                d = spatial.process(d)
+                d = temporal.process(d)
+                d = hole_fill.process(d)
+                depth_frame = d
+            if depth_frame is None:
+                raise RuntimeError("no valid depth frames captured")
+
+            # Convert to point cloud
+            pc = rs.pointcloud()
+            points = pc.calculate(depth_frame)
+            verts = (np.asanyarray(points.get_vertices())
+                       .view(np.float32)
+                       .reshape(-1, 3))
+
+            # Drop zero-depth points and anything outside the D405's
+            # accurate range. Matches the UI's old clipping (~4cm - 50cm).
+            z = verts[:, 2]
+            mask = (z > 0.04) & (z < 0.50)
+            verts = verts[mask]
+
+            n_points = int(verts.shape[0])
+            logger.info(f"capture_pose: {n_points} points after filtering")
+
+            # ── Write binary little-endian PLY ────────────────────────────
+            # Open3D reads this format just fine on the UI side.
+            header = (
+                "ply\n"
+                "format binary_little_endian 1.0\n"
+                f"element vertex {n_points}\n"
+                "property float x\n"
+                "property float y\n"
+                "property float z\n"
+                "end_header\n"
+            )
+            with open(ply_path, "wb") as f:
+                f.write(header.encode("ascii"))
+                f.write(verts.astype(np.float32).tobytes())
 
             self._send({
                 "type": "capture_complete",
@@ -237,6 +308,11 @@ class PipelineServer:
                 "message": str(e),
             })
         finally:
+            if pipe is not None:
+                try:
+                    pipe.stop()
+                except Exception:
+                    pass
             logging.getLogger().removeHandler(self.gui_handler)
             self.gui_handler.set_client(None)
 
