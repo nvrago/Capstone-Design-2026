@@ -87,7 +87,7 @@ class PipelineConfig:
 
     # zero subtraction
     zero_reference_path: str = "data/reference/zero_cloud.ply"
-    zero_distance_threshold: float = 0.005
+    zero_distance_threshold: float = 0.003
 
     # processing
     voxel_size: float = 0.005
