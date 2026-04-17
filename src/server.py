@@ -424,7 +424,6 @@ def main():
     if args.mock:
         config.use_mock_arc = True
 
-    global PORT
     PORT = args.port
 
     server = PipelineServer(config)
