@@ -257,20 +257,28 @@ class PipelineServer:
                 self._send({"type": "error", "message": f"unknown config key: {key}"})
 
         elif action == "capture_frame":
-        # Called from the UI between motion stops during a stepped scan.
-        # Runs synchronously on the accept thread — capture is expected to
-        # take under a second, so this doesn't block inbound commands long.
+            # Called from the UI between motion stops during a stepped scan.
+            # start_scan_session must have run first; self.pipe is guaranteed to exist.
             req_id = cmd.get("request_id")
             index = cmd.get("index")
             angle = cmd.get("angle_deg")
-            target_steps = cmd.get("target_steps")
+            target_steps = cmd.get("target_steps", 0)
 
             logger.info(f"capture_frame req={req_id} idx={index} angle={angle}")
 
+            if self.pipe is None:
+                # Shouldn't happen since __init__ creates a pipe, but be safe
+                self._send({
+                "type": "capture_result",
+                    "request_id": req_id,
+                    "ok": False,
+                    "index": index,
+                    "angle_deg": angle,
+                    "error": "no active pipeline — send start_scan_session first",
+                })
+                return
+
             try:
-                # self.pipe must have a capture_frame method; see note below.
-                # Should return something like {"point_count": N, "path": "..."}
-                # or raise on failure.
                 result = self.pipe.capture_frame(
                     index=index,
                     angle_deg=angle,
@@ -294,43 +302,6 @@ class PipelineServer:
                     "angle_deg": angle,
                     "error": str(e),
                 })
-        elif action == "capture_frame":
-            req_id = cmd.get("request_id")
-            index = cmd.get("index")
-            angle = cmd.get("angle_deg")
-            target_steps = cmd.get("target_steps", 0)
-
-            logger.info(f"capture_frame req={req_id} idx={index} angle={angle}")
-
-            # Ensure we have a pipeline object to capture against. If one doesn't
-            # exist yet (fresh server boot, no prior run), create one.
-            if self.pipe is None:
-                self.pipe = ScanPipeline(self.config)
-
-                try:
-                    result = self.pipe.capture_frame(
-                        index=index,
-                        angle_deg=angle,
-                        target_steps=target_steps,
-                    )
-                    self._send({
-                        "type": "capture_result",
-                        "request_id": req_id,
-                        "ok": True,
-                        "index": index,
-                        "angle_deg": angle,
-                        **(result or {}),
-                    })
-                except Exception as e:
-                    logger.error(f"capture_frame failed: {e}", exc_info=True)
-                    self._send({
-                        "type": "capture_result",
-                        "request_id": req_id,
-                        "ok": False,
-                        "index": index,
-                        "angle_deg": angle,
-                        "error": str(e),
-                    })
         elif action == "start_scan_session":
             # Fresh pipeline for interactive capture. Any prior state is discarded;
             # a subsequent pipeline "scan" command will also start fresh.
