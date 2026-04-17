@@ -1580,7 +1580,7 @@ class ScanToMillUI(QMainWindow):
             self._scan_worker.stop()
         if hasattr(self, "_stepped_worker") and self._stepped_worker.isRunning():
             self._stepped_worker.stop()
-        self._modbus.send_command(CCMD_STOP
+        self._modbus.send_command(CCMD_STOP)
         self._pipeline.send_cmd(cmd="end_scan_session")
         self._reset_scan_ui()
         self.progress_bar.setValue(0)
