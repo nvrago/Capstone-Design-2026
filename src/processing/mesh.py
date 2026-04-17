@@ -105,10 +105,25 @@ class Mesh:
         self.mesh.remove_duplicated_triangles()
         self.mesh.remove_duplicated_vertices()
         self.mesh.remove_unreferenced_vertices()
+
+    def remove_small_components(self, min_ratio: float = 0.1):
+        """remove disconnected mesh fragments smaller than min_ratio of the largest component."""
+        triangle_clusters, cluster_n_triangles, _ = (
+            self.mesh.cluster_connected_triangles()
+        )
+        triangle_clusters = np.asarray(triangle_clusters)
+        cluster_n_triangles = np.asarray(cluster_n_triangles)
+        largest = cluster_n_triangles.max()
+        threshold = int(largest * min_ratio)
+        triangles_to_remove = cluster_n_triangles[triangle_clusters] < threshold
+        self.mesh.remove_triangles_by_mask(triangles_to_remove)
+        self.mesh.remove_unreferenced_vertices()
+        n_removed = triangles_to_remove.sum()
+        logger.info(f"removed {n_removed} triangles from small components "
+                     f"(threshold: {threshold} of {largest})")
         
     def fill_holes(self):
         """Attempt to fill holes in mesh."""
-        # Open3D doesn't have direct hole filling, but we can detect holes
         edges = self.mesh.get_non_manifold_edges()
         if len(edges) > 0:
             logger.warning(f"Mesh has {len(edges)} non-manifold edges (holes)")
@@ -151,6 +166,12 @@ class MeshReconstructor:
         )
         
         self.last_densities = np.asarray(densities)
+
+        # trim low-density vertices (poisson artifacts at edges)
+        threshold = np.quantile(self.last_densities, 0.15)
+        vertices_to_remove = self.last_densities < threshold
+        mesh.remove_vertices_by_mask(vertices_to_remove)
+        logger.info(f"density trim: removed {vertices_to_remove.sum()} low-confidence vertices")
         
         result = Mesh()
         result.mesh = mesh
@@ -168,7 +189,6 @@ class MeshReconstructor:
         mesh = self.poisson_reconstruction(pointcloud, depth=depth)
         
         if self.last_densities is not None:
-            # Remove low-density vertices
             threshold = np.quantile(self.last_densities, density_threshold)
             vertices_to_remove = self.last_densities < threshold
             mesh.mesh.remove_vertices_by_mask(vertices_to_remove)
