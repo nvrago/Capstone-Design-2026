@@ -841,59 +841,59 @@ class ScanToMillUI(QMainWindow):
         self._init_pipeline()
 
     # ── Pipeline server link ──────────────────────────────────────────────────
-def _init_pipeline(self):
-    self._pipeline = PipelineClient(
-        host=PIPELINE_DEFAULT_HOST,
-        port=PIPELINE_DEFAULT_PORT,
-    )
-    self._pipeline.connected.connect(self._on_pipeline_connected)
-    self._pipeline.pipeline_state.connect(self._on_pipeline_state)
-    self._pipeline.log_message.connect(self._log)
-    self._pipeline.error.connect(self._log)
-    self._pipeline_last_state = {}
-    self._log(f"[PIPE] Connecting to server.py at "
-              f"{PIPELINE_DEFAULT_HOST}:{PIPELINE_DEFAULT_PORT}...")
-    self._pipeline.start()
+    def _init_pipeline(self):
+        self._pipeline = PipelineClient(
+            host=PIPELINE_DEFAULT_HOST,
+            port=PIPELINE_DEFAULT_PORT,
+        )
+        self._pipeline.connected.connect(self._on_pipeline_connected)
+        self._pipeline.pipeline_state.connect(self._on_pipeline_state)
+        self._pipeline.log_message.connect(self._log)
+        self._pipeline.error.connect(self._log)
+        self._pipeline_last_state = {}
+        self._log(f"[PIPE] Connecting to server.py at "
+                  f"{PIPELINE_DEFAULT_HOST}:{PIPELINE_DEFAULT_PORT}...")
+        self._pipeline.start()
 
-def _on_pipeline_connected(self, ok: bool):
-    if ok:
-        self._log("[PIPE] server.py link ESTABLISHED.")
-        self.lbl_camera_status.setText("● CAMERA ONLINE")
-        self.lbl_camera_status.setObjectName("status_ok")
-        # Qt needs a style refresh to pick up the new objectName
-        self.lbl_camera_status.style().unpolish(self.lbl_camera_status)
-        self.lbl_camera_status.style().polish(self.lbl_camera_status)
-        # Ask for current state so UI reflects reality on first connect
-        self._pipeline.request_status()
-    else:
-        self._log("[PIPE] server.py link DOWN.")
-        self.lbl_camera_status.setText("● CAMERA OFFLINE")
-        self.lbl_camera_status.setObjectName("status_off")
-        self.lbl_camera_status.style().unpolish(self.lbl_camera_status)
-        self.lbl_camera_status.style().polish(self.lbl_camera_status)
+    def _on_pipeline_connected(self, ok: bool):
+        if ok:
+            self._log("[PIPE] server.py link ESTABLISHED.")
+            self.lbl_camera_status.setText("● CAMERA ONLINE")
+            self.lbl_camera_status.setObjectName("status_ok")
+            # Qt needs a style refresh to pick up the new objectName
+            self.lbl_camera_status.style().unpolish(self.lbl_camera_status)
+            self.lbl_camera_status.style().polish(self.lbl_camera_status)
+            # Ask for current state so UI reflects reality on first connect
+            self._pipeline.request_status()
+        else:
+            self._log("[PIPE] server.py link DOWN.")
+            self.lbl_camera_status.setText("● CAMERA OFFLINE")
+            self.lbl_camera_status.setObjectName("status_off")
+            self.lbl_camera_status.style().unpolish(self.lbl_camera_status)
+            self.lbl_camera_status.style().polish(self.lbl_camera_status)
 
-def _on_pipeline_state(self, state: dict):
-    prev = self._pipeline_last_state
-    new_state = state.get("state")
-    old_state = prev.get("state")
-    if new_state != old_state:
-        self._log(f"[PIPE] STATE: {new_state}")
+    def _on_pipeline_state(self, state: dict):
+        prev = self._pipeline_last_state
+        new_state = state.get("state")
+        old_state = prev.get("state")
+        if new_state != old_state:
+            self._log(f"[PIPE] STATE: {new_state}")
 
-    stage = state.get("stage")
-    stage_name = state.get("stage_name")
-    if stage is not None and stage != prev.get("stage"):
-        self._log(f"[PIPE] Stage {stage}: {stage_name or '?'}")
+        stage = state.get("stage")
+        stage_name = state.get("stage_name")
+        if stage is not None and stage != prev.get("stage"):
+            self._log(f"[PIPE] Stage {stage}: {stage_name or '?'}")
 
-    # On pipeline completion, unlock post-process if we want that behavior
-    if new_state == "complete" and old_state != "complete":
-        run_dir = state.get("run_dir")
-        if run_dir:
-            self._log(f"[PIPE] Run complete: {run_dir}")
-        self.btn_export.setEnabled(True)
-    elif new_state == "error":
-        self._log(f"[PIPE] !! ERROR: {state.get('message', '(no detail)')}")
+        # On pipeline completion, unlock post-process if we want that behavior
+        if new_state == "complete" and old_state != "complete":
+            run_dir = state.get("run_dir")
+            if run_dir:
+                self._log(f"[PIPE] Run complete: {run_dir}")
+            self.btn_export.setEnabled(True)
+        elif new_state == "error":
+            self._log(f"[PIPE] !! ERROR: {state.get('message', '(no detail)')}")
 
-    self._pipeline_last_state = state
+        self._pipeline_last_state = state
     # ── Modbus TCP link to ClearCore ──────────────────────────────────────────
     def _init_modbus(self):
         self._modbus = ClearCoreModbus(
