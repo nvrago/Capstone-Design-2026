@@ -16,6 +16,7 @@ protocol (JSON over TCP on localhost:5001):
         {"cmd": "status"}
         {"cmd": "stage", "stage": 3, "end": 5}
         {"cmd": "config", "key": "arc_step_deg", "value": 10.0}
+        {"cmd": "capture_pose", "pose_deg": 0.0, "pose_idx": 1}
 
     server to GUI:
         {"type": "status", "state": "idle"}
@@ -23,6 +24,8 @@ protocol (JSON over TCP on localhost:5001):
         {"type": "status", "state": "complete", "run_dir": "data/runs/..."}
         {"type": "status", "state": "error", "message": "no device connected"}
         {"type": "log", "level": "info", "message": "captured 12000 points"}
+        {"type": "capture_complete", "ply_path": "...", "n_points": 12345,
+         "pose_idx": 1, "pose_deg": 0.0}
 
 the GUI doesn't need to know about venvs, paths, or Python. it just
 opens a socket and sends/receives JSON lines.
@@ -165,6 +168,78 @@ class PipelineServer:
             logging.getLogger().removeHandler(self.gui_handler)
             self.gui_handler.set_client(None)
 
+    def _run_capture_pose(self, pose_deg: float, pose_idx: int):
+        """single-pose capture for the UI's multi-pose scan flow.
+
+        the UI is driving arc motion via the ClearCore directly (Modbus),
+        so we don't move anything here -- we just open the RealSense,
+        grab a temporally-averaged frame, save a .ply into the active run
+        directory, and report the path back over the socket.
+
+        keeping this separate from the full `scan` pipeline means the GUI
+        can stitch together an arbitrary number of poses without having
+        to pretend each one is a full stage run.
+        """
+        from pathlib import Path
+        from datetime import datetime
+        # Import here so the rest of server.py still works on a dev machine
+        # without pyrealsense2 installed.
+        from scanner.capture import RealSenseCapture
+
+        self.state = "running"
+        self.current_stage_name = f"capture_pose_{pose_idx}"
+
+        try:
+            logging.getLogger().addHandler(self.gui_handler)
+            self.gui_handler.set_client(self.client)
+
+            # Pick an output directory: reuse the pipeline's run_dir if one
+            # already exists, otherwise drop into data/poses/<timestamp>.
+            if self.pipe and self.pipe.run_dir:
+                out_dir = Path(self.pipe.run_dir) / "poses"
+            else:
+                stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                out_dir = Path("data") / "poses" / stamp
+            out_dir.mkdir(parents=True, exist_ok=True)
+
+            ply_path = out_dir / f"pose_{pose_idx:03d}_{pose_deg:+07.2f}deg.ply"
+
+            logger.info(
+                f"capture_pose: idx={pose_idx} deg={pose_deg:+.2f} -> {ply_path}"
+            )
+
+            cam = RealSenseCapture(width=640, height=480, fps=30,
+                                   temporal_frames=15)
+            try:
+                cam.start()
+                pcd = cam.capture(output_path=str(ply_path))
+                n_points = len(pcd.points)
+            finally:
+                cam.stop()
+
+            self._send({
+                "type": "capture_complete",
+                "ply_path": str(ply_path),
+                "n_points": n_points,
+                "pose_idx": pose_idx,
+                "pose_deg": pose_deg,
+            })
+            self.state = "idle"
+            self._send_status(message=f"pose {pose_idx} captured")
+
+        except Exception as e:
+            self.state = "error"
+            logger.error(f"capture_pose error: {e}", exc_info=True)
+            self._send_status(message=str(e))
+            self._send({
+                "type": "capture_failed",
+                "pose_idx": pose_idx,
+                "message": str(e),
+            })
+        finally:
+            logging.getLogger().removeHandler(self.gui_handler)
+            self.gui_handler.set_client(None)
+
     def handle_command(self, raw: str):
         """parse and execute a command from the GUI."""
         try:
@@ -221,6 +296,23 @@ class PipelineServer:
                     "end_stage": end,
                     "dry_run": dry_run,
                 },
+                daemon=True,
+            )
+            self.run_thread.start()
+            self._send_status()
+
+        elif action == "capture_pose":
+            if self.state == "running":
+                self._send({"type": "error",
+                            "message": "pipeline already running"})
+                return
+
+            pose_deg = float(cmd.get("pose_deg", 0.0))
+            pose_idx = int(cmd.get("pose_idx", 0))
+
+            self.run_thread = threading.Thread(
+                target=self._run_capture_pose,
+                kwargs={"pose_deg": pose_deg, "pose_idx": pose_idx},
                 daemon=True,
             )
             self.run_thread.start()
