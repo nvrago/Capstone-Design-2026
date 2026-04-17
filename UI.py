@@ -232,7 +232,214 @@ def make_empty_pointcloud() -> pv.PolyData:
     cloud = pv.PolyData(np.empty((0, 3), dtype=np.float32))
     cloud["depth"] = np.empty((0,), dtype=np.float32)
     return cloud
+# ── Pipeline server (server.py) TCP/JSON client ───────────────────────────────
+#
+# The Pi also runs a separate process (server.py) that manages the multi-stage
+# scan-to-mill pipeline: capture, register, mesh, toolpath, etc. It speaks
+# line-delimited JSON over TCP on localhost:5001.
+#
+# This is independent of the Modbus link to the ClearCore. The Modbus link
+# drives the motor directly (Start Scan -> CCMD_RUN_1). The pipeline server
+# orchestrates the higher-level workflow. For now they're parallel channels;
+# you can use either or both from the UI.
+#
+# Protocol reference (see server.py docstring for the full list):
+#   UI -> server:  {"cmd": "scan"}  {"cmd": "zero"}  {"cmd": "stop"}
+#                  {"cmd": "status"}  {"cmd": "stage", "stage": N, "end": M}
+#                  {"cmd": "config", "key": "...", "value": ...}
+#   server -> UI:  {"type": "status",  "state": "idle"|"running"|"complete"|...}
+#                  {"type": "log",     "level": "...", "message": "..."}
+#                  {"type": "error",   "message": "..."}
 
+PIPELINE_DEFAULT_HOST = "127.0.0.1"
+PIPELINE_DEFAULT_PORT = 5001
+PIPELINE_RECONNECT_SEC = 3.0   # backoff when server.py isn't running
+
+
+class PipelineClient(QThread):
+    """Background worker owning the TCP/JSON link to server.py.
+
+    Emits Qt signals for each message category. Main thread calls
+    send_cmd() / scan() / etc. to issue commands.
+    """
+
+    connected      = pyqtSignal(bool)   # True on open, False on close/error
+    pipeline_state = pyqtSignal(dict)   # {"state": "running", "stage": 2, ...}
+    log_message    = pyqtSignal(str)    # log lines forwarded from the server
+    error          = pyqtSignal(str)
+
+    def __init__(self, host: str = PIPELINE_DEFAULT_HOST,
+                 port: int = PIPELINE_DEFAULT_PORT, parent=None):
+        super().__init__(parent)
+        import socket as _socket
+        self._socket_mod = _socket
+        self._host = host
+        self._port = port
+        self._sock = None
+        self._cmd_queue: "queue.Queue[dict]" = queue.Queue()
+        self._stop_flag = False
+        self._connected = False
+        self._send_lock = None   # created in run() on the worker thread
+
+    # ── Public API (main thread) ──────────────────────────────────────────────
+    def send_cmd(self, **cmd):
+        """Queue a command for the server. Non-blocking.
+
+        Usage: self._pipeline.send_cmd(cmd="scan", dry_run=True)
+        """
+        self._cmd_queue.put(cmd)
+
+    def scan(self, dry_run: bool = False, skip_execute: bool = True):
+        self.send_cmd(cmd="scan", dry_run=dry_run, skip_execute=skip_execute)
+
+    def zero(self):
+        self.send_cmd(cmd="zero")
+
+    def run_stages(self, start: int, end: int, dry_run: bool = False):
+        self.send_cmd(cmd="stage", stage=start, end=end, dry_run=dry_run)
+
+    def stop_pipeline(self):
+        self.send_cmd(cmd="stop")
+
+    def request_status(self):
+        self.send_cmd(cmd="status")
+
+    def set_config(self, key: str, value):
+        self.send_cmd(cmd="config", key=key, value=value)
+
+    def stop(self):
+        """Shut down the worker thread (called from the main thread)."""
+        self._stop_flag = True
+
+    # ── Worker thread ─────────────────────────────────────────────────────────
+    def run(self):
+        import threading as _threading
+        self._send_lock = _threading.Lock()
+
+        while not self._stop_flag:
+            if not self._open_socket():
+                # backoff, stay responsive to stop
+                for _ in range(int(PIPELINE_RECONNECT_SEC * 10)):
+                    if self._stop_flag:
+                        return
+                    self.msleep(100)
+                continue
+
+            self._service_connection()
+            self._close_socket()
+
+        self._close_socket()
+
+    def _open_socket(self) -> bool:
+        try:
+            s = self._socket_mod.socket(self._socket_mod.AF_INET,
+                                        self._socket_mod.SOCK_STREAM)
+            s.settimeout(2.0)
+            s.connect((self._host, self._port))
+            s.settimeout(0.2)   # short read timeout so we can check stop flag
+            self._sock = s
+            self._connected = True
+            self.connected.emit(True)
+            self.log_message.emit(
+                f"[PIPE] Connected to server.py at {self._host}:{self._port}"
+            )
+            return True
+        except (OSError, ConnectionRefusedError) as e:
+            # Server not running yet — quiet retry. Only log on first failure.
+            if self._connected:
+                self.error.emit(f"[PIPE] Connection lost: {e}")
+            self._connected = False
+            return False
+
+    def _close_socket(self):
+        try:
+            if self._sock is not None:
+                self._sock.close()
+        except Exception:
+            pass
+        self._sock = None
+        if self._connected:
+            self._connected = False
+            self.connected.emit(False)
+            self.log_message.emit("[PIPE] Link closed.")
+
+    def _service_connection(self):
+        """Interleave command draining and line-delimited JSON reads.
+
+        Uses a short socket recv() timeout so the loop stays responsive to
+        the stop flag and doesn't starve the command queue.
+        """
+        import json as _json
+        buffer = ""
+        while not self._stop_flag:
+            # 1. Drain outbound commands
+            self._drain_command_queue()
+
+            # 2. Read any inbound data
+            try:
+                chunk = self._sock.recv(4096)
+                if not chunk:
+                    # server closed connection
+                    return
+                buffer += chunk.decode("utf-8", errors="replace")
+                while "\n" in buffer:
+                    line, buffer = buffer.split("\n", 1)
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        msg = _json.loads(line)
+                    except _json.JSONDecodeError:
+                        self.error.emit(f"[PIPE] Bad JSON: {line!r}")
+                        continue
+                    self._dispatch(msg)
+            except self._socket_mod.timeout:
+                # normal - just means no data in the last 200ms
+                pass
+            except (OSError, ConnectionResetError, BrokenPipeError) as e:
+                self.error.emit(f"[PIPE] Read error: {e}")
+                return
+
+    def _drain_command_queue(self):
+        import json as _json
+        while True:
+            try:
+                cmd = self._cmd_queue.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                data = (_json.dumps(cmd) + "\n").encode("utf-8")
+                with self._send_lock:
+                    self._sock.sendall(data)
+                self.log_message.emit(f"[PIPE] -> {cmd.get('cmd', '?')}")
+            except (OSError, BrokenPipeError) as e:
+                self.error.emit(f"[PIPE] Write error: {e}")
+                # Drop the socket; outer loop will reconnect
+                try:
+                    self._sock.close()
+                except Exception:
+                    pass
+                self._sock = None
+                return
+
+    def _dispatch(self, msg: dict):
+        """Route a parsed JSON message to the appropriate Qt signal."""
+        mtype = msg.get("type", "")
+        if mtype == "status":
+            self.pipeline_state.emit(msg)
+        elif mtype == "log":
+            level = msg.get("level", "info").upper()
+            text = msg.get("message", "")
+            self.log_message.emit(f"[PIPE/{level}] {text}")
+        elif mtype == "error":
+            self.error.emit(f"[PIPE] {msg.get('message', '')}")
+        elif mtype == "config_updated":
+            key = msg.get("key")
+            val = msg.get("value")
+            self.log_message.emit(f"[PIPE] config {key} = {val}")
+        else:
+            # Unknown message type — log it so we don't silently drop things
+            self.log_message.emit(f"[PIPE] <{mtype}> {msg}")
 
 # ── ClearCore Modbus TCP Link ─────────────────────────────────────────────────
 #
@@ -631,7 +838,62 @@ class ScanToMillUI(QMainWindow):
         self._build_ui()
         self._start_clock()
         self._init_modbus()
+        self._init_pipeline()
 
+    # ── Pipeline server link ──────────────────────────────────────────────────
+def _init_pipeline(self):
+    self._pipeline = PipelineClient(
+        host=PIPELINE_DEFAULT_HOST,
+        port=PIPELINE_DEFAULT_PORT,
+    )
+    self._pipeline.connected.connect(self._on_pipeline_connected)
+    self._pipeline.pipeline_state.connect(self._on_pipeline_state)
+    self._pipeline.log_message.connect(self._log)
+    self._pipeline.error.connect(self._log)
+    self._pipeline_last_state = {}
+    self._log(f"[PIPE] Connecting to server.py at "
+              f"{PIPELINE_DEFAULT_HOST}:{PIPELINE_DEFAULT_PORT}...")
+    self._pipeline.start()
+
+def _on_pipeline_connected(self, ok: bool):
+    if ok:
+        self._log("[PIPE] server.py link ESTABLISHED.")
+        self.lbl_camera_status.setText("● CAMERA ONLINE")
+        self.lbl_camera_status.setObjectName("status_ok")
+        # Qt needs a style refresh to pick up the new objectName
+        self.lbl_camera_status.style().unpolish(self.lbl_camera_status)
+        self.lbl_camera_status.style().polish(self.lbl_camera_status)
+        # Ask for current state so UI reflects reality on first connect
+        self._pipeline.request_status()
+    else:
+        self._log("[PIPE] server.py link DOWN.")
+        self.lbl_camera_status.setText("● CAMERA OFFLINE")
+        self.lbl_camera_status.setObjectName("status_off")
+        self.lbl_camera_status.style().unpolish(self.lbl_camera_status)
+        self.lbl_camera_status.style().polish(self.lbl_camera_status)
+
+def _on_pipeline_state(self, state: dict):
+    prev = self._pipeline_last_state
+    new_state = state.get("state")
+    old_state = prev.get("state")
+    if new_state != old_state:
+        self._log(f"[PIPE] STATE: {new_state}")
+
+    stage = state.get("stage")
+    stage_name = state.get("stage_name")
+    if stage is not None and stage != prev.get("stage"):
+        self._log(f"[PIPE] Stage {stage}: {stage_name or '?'}")
+
+    # On pipeline completion, unlock post-process if we want that behavior
+    if new_state == "complete" and old_state != "complete":
+        run_dir = state.get("run_dir")
+        if run_dir:
+            self._log(f"[PIPE] Run complete: {run_dir}")
+        self.btn_export.setEnabled(True)
+    elif new_state == "error":
+        self._log(f"[PIPE] !! ERROR: {state.get('message', '(no detail)')}")
+
+    self._pipeline_last_state = state
     # ── Modbus TCP link to ClearCore ──────────────────────────────────────────
     def _init_modbus(self):
         self._modbus = ClearCoreModbus(
@@ -1043,6 +1305,9 @@ class ScanToMillUI(QMainWindow):
             self._modbus.send_command(CCMD_DISAB_MTRS)
             self._modbus.stop()
             self._modbus.wait(2000)
+        if hasattr(self, "_pipeline") and self._pipeline.isRunning():    
+            self._pipeline.stop()                                        
+            self._pipeline.wait(2000)                                    
         if hasattr(self, "plotter"):
             self.plotter.close()
         event.accept()
