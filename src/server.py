@@ -16,13 +16,16 @@ protocol (JSON over TCP on localhost:5001):
         {"cmd": "status"}
         {"cmd": "stage", "stage": 3, "end": 5}
         {"cmd": "config", "key": "arc_step_deg", "value": 10.0}
-
+        {"cmd": "capture_frame", "request_id": 1, "index": 0, "angle_deg": 0.0, "target_steps": 0}
+        
     server to GUI:
         {"type": "status", "state": "idle"}
         {"type": "status", "state": "running", "stage": 2, "stage_name": "register"}
         {"type": "status", "state": "complete", "run_dir": "data/runs/..."}
         {"type": "status", "state": "error", "message": "no device connected"}
         {"type": "log", "level": "info", "message": "captured 12000 points"}
+        {"type": "capture_result", "request_id": 1, "ok": true, "index": 0, "angle_deg": 0.0, "point_count": 4823}
+        {"type": "capture_result", "request_id": 1, "ok": false, "index": 0, "angle_deg": 0.0, "error": "no device connected"}
 
 the GUI doesn't need to know about venvs, paths, or Python. it just
 opens a socket and sends/receives JSON lines.
@@ -246,9 +249,48 @@ class PipelineServer:
             else:
                 self._send({"type": "error", "message": f"unknown config key: {key}"})
 
+        elif action == "capture_frame":
+        # Called from the UI between motion stops during a stepped scan.
+        # Runs synchronously on the accept thread — capture is expected to
+        # take under a second, so this doesn't block inbound commands long.
+        req_id = cmd.get("request_id")
+        index = cmd.get("index")
+        angle = cmd.get("angle_deg")
+        target_steps = cmd.get("target_steps")
+
+        logger.info(f"capture_frame req={req_id} idx={index} angle={angle}")
+
+        try:
+            # self.pipe must have a capture_frame method; see note below.
+            # Should return something like {"point_count": N, "path": "..."}
+            # or raise on failure.
+            result = self.pipe.capture_frame(
+                index=index,
+                angle_deg=angle,
+                target_steps=target_steps,
+            )
+            self._send({
+                "type": "capture_result",
+                "request_id": req_id,
+                "ok": True,
+                "index": index,
+                "angle_deg": angle,
+                **(result or {}),
+            })
+        except Exception as e:
+            logger.error(f"capture_frame failed: {e}", exc_info=True)
+            self._send({
+                "type": "capture_result",
+                "request_id": req_id,
+                "ok": False,
+                "index": index,
+                "angle_deg": angle,
+                "error": str(e),
+            })
+        
         else:
             self._send({"type": "error", "message": f"unknown command: {action}"})
-
+        
     def serve(self):
         """start the TCP server and listen for GUI connections."""
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
