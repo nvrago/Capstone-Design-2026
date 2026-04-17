@@ -106,7 +106,10 @@ class GUIHandler(logging.Handler):
 class PipelineServer:
     def __init__(self, config: PipelineConfig = None):
         self.config = config or PipelineConfig()
-        self.pipe = ScanPipeline(self.config)
+        # ScanPipeline is built lazily inside _run_pipeline/_run_zero so
+        # the server can start without OpenCAMLib/Open3D installed. The
+        # `capture_pose` flow doesn't need it at all.
+        self.pipe = None
         self.state = "idle"
         self.current_stage = 0
         self.current_stage_name = ""
