@@ -38,7 +38,31 @@ import threading
 import time
 from pathlib import Path
 
-from pipeline import ScanPipeline, PipelineConfig
+# Note: `from pipeline import ScanPipeline, PipelineConfig` is deferred
+# into the methods that actually use it. That lets the server start up
+# and service `capture_pose` even when the full ScanPipeline's deps
+# (OpenCAMLib, Open3D, etc.) aren't installed. `capture_pose` only uses
+# pyrealsense2 + numpy and is fully self-contained.
+try:
+    from pipeline import PipelineConfig
+    _SCANPIPELINE_AVAILABLE = True
+except ImportError as _scanpipe_err:
+    _SCANPIPELINE_AVAILABLE = False
+    _SCANPIPE_IMPORT_ERROR = _scanpipe_err
+
+    # Minimal stand-in so the server can still construct a default config
+    # and carry it around. `scan` / `zero` / `stage` will fail loudly when
+    # invoked, but startup + `capture_pose` work fine.
+    class PipelineConfig:  # type: ignore[no-redef]
+        def __init__(self):
+            self.use_mock_arc = False
+
+        @classmethod
+        def from_yaml(cls, path):
+            raise RuntimeError(
+                "PipelineConfig.from_yaml unavailable: "
+                f"ScanPipeline import failed ({_scanpipe_err})"
+            )
 
 logger = logging.getLogger(__name__)
 
@@ -119,6 +143,14 @@ class PipelineServer:
         self._stop_requested = False
 
         try:
+            from pipeline import ScanPipeline  # deferred to avoid OCL dep at startup
+        except ImportError as e:
+            self.state = "error"
+            self._send_status(message=f"ScanPipeline unavailable: {e}")
+            logger.error(f"ScanPipeline import failed: {e}")
+            return
+
+        try:
             logging.getLogger().addHandler(self.gui_handler)
             self.gui_handler.set_client(self.client)
 
@@ -150,6 +182,14 @@ class PipelineServer:
         """capture zero reference in background thread."""
         self.state = "running"
         self.current_stage_name = "zero_capture"
+
+        try:
+            from pipeline import ScanPipeline  # deferred to avoid OCL dep at startup
+        except ImportError as e:
+            self.state = "error"
+            self._send_status(message=f"ScanPipeline unavailable: {e}")
+            logger.error(f"ScanPipeline import failed: {e}")
+            return
 
         try:
             logging.getLogger().addHandler(self.gui_handler)
