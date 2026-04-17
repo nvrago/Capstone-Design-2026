@@ -448,6 +448,7 @@ class ScanPipeline:
         )
 
         mesh.remove_degenerate()
+        mesh.remove_small_components(min_ratio=0.1)
 
         if self.config.smooth_iterations > 0:
             mesh.smooth_laplacian(iterations=self.config.smooth_iterations)

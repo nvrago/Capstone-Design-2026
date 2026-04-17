@@ -4,11 +4,12 @@ zero_mesh.py -- background subtraction for scan-to-cnc pipeline
 workflow:
     1. capture zero scans (empty plate, all arc positions) -> store as reference
     2. on each real scan, subtract reference point cloud before meshing
-    3. what remains is only the object geometry
+    3. clip everything below the plate surface using max Z from reference
+    4. what remains is only the object geometry
 
-two modes:
-    capture_zero: scan empty plate and save reference cloud
-    subtract: remove reference points from a scan before processing
+two subtraction methods applied in sequence:
+    kd-tree: removes points spatially near the reference (handles edges, apparatus)
+    z-clip: removes everything below the plate surface (handles flat plate cleanly)
 """
 
 import numpy as np
@@ -72,7 +73,7 @@ def load_zero(path: Path = ZERO_CLOUD_PATH) -> o3d.geometry.PointCloud:
     return pcd
 
 
-# subtraction
+# kd-tree subtraction
 
 def subtract_zero(
     scan: o3d.geometry.PointCloud,
@@ -98,7 +99,6 @@ def subtract_zero(
         logger.warning("reference cloud is empty, skipping subtraction")
         return scan
 
-    # build KD-tree from reference cloud for fast nearest neighbor lookup
     ref_tree = o3d.geometry.KDTreeFlann(reference)
 
     object_indices = []
@@ -111,10 +111,60 @@ def subtract_zero(
 
     object_cloud = scan.select_by_index(object_indices)
     n_removed = len(scan.points) - len(object_cloud.points)
-    logger.info(f"zero subtraction: removed {n_removed} background points, "
+    logger.info(f"kd-tree subtraction: removed {n_removed} background points, "
                 f"{len(object_cloud.points)} object points remain")
 
     return object_cloud
+
+
+# z-clip using reference surface
+
+def clip_below_reference(
+    scan: o3d.geometry.PointCloud,
+    reference: o3d.geometry.PointCloud,
+    buffer_m: float = 0.001
+) -> o3d.geometry.PointCloud:
+    """
+    remove all points at or below the plate surface.
+
+    finds the max Z value in the reference cloud (highest point on the
+    empty plate), adds a small buffer, and removes everything below that
+    threshold from the scan. this cleanly eliminates the flat plate
+    surface that kd-tree subtraction might miss.
+
+    args:
+        scan: point cloud to clip (usually after kd-tree subtraction)
+        reference: zero reference cloud
+        buffer_m: buffer above max Z to keep (meters). default 1mm.
+            positive = keep more (safer), negative = clip more aggressively.
+
+    returns:
+        point cloud with plate surface removed
+    """
+    if len(reference.points) == 0:
+        logger.warning("reference cloud is empty, skipping z-clip")
+        return scan
+
+    ref_points = np.asarray(reference.points)
+    max_z = np.max(ref_points[:, 2])
+    # subtract buffer so we clip slightly into the plate rather than above it
+    clip_z = max_z - buffer_m
+
+    scan_points = np.asarray(scan.points)
+
+    # the D405 looks down, so Z increases with distance from camera.
+    # the plate is far (high Z), the object sticks up toward camera (lower Z).
+    # keep points that are closer to the camera than the plate surface.
+    object_mask = scan_points[:, 2] < clip_z
+    object_indices = np.where(object_mask)[0].tolist()
+
+    clipped = scan.select_by_index(object_indices)
+    n_removed = len(scan.points) - len(clipped.points)
+
+    logger.info(f"z-clip: plate max Z={max_z:.4f}m, threshold={clip_z:.4f}m, "
+                f"removed {n_removed} points below plate, {len(clipped.points)} remain")
+
+    return clipped
 
 
 # convenience: full subtract pipeline step
@@ -122,10 +172,14 @@ def subtract_zero(
 def apply_zero_subtraction(
     scan: o3d.geometry.PointCloud,
     reference_path: Path = ZERO_CLOUD_PATH,
-    distance_threshold: float = 0.003
+    distance_threshold: float = 0.003,
+    z_clip: bool = True,
+    z_clip_buffer: float = 0.002
 ) -> o3d.geometry.PointCloud:
     """
-    load reference and subtract from scan in one call.
+    load reference and apply both subtraction methods in one call.
+
+    runs kd-tree subtraction first, then z-clip if enabled.
 
     usage in pipeline.py:
         pcd = capture()
@@ -134,7 +188,16 @@ def apply_zero_subtraction(
     """
     try:
         reference = load_zero(reference_path)
-        return subtract_zero(scan, reference, distance_threshold)
+
+        # step 1: kd-tree subtraction (handles edges, apparatus)
+        result = subtract_zero(scan, reference, distance_threshold)
+
+        # step 2: z-clip (handles flat plate surface)
+        if z_clip:
+            result = clip_below_reference(result, reference, z_clip_buffer)
+
+        return result
+
     except FileNotFoundError as e:
         logger.warning(f"zero subtraction skipped: {e}")
         return scan
