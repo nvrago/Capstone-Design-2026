@@ -80,10 +80,8 @@ def parse_args():
     # hardware
     p.add_argument("--mock", action="store_true",
                    help="use mock arc controller (no ClearCore hardware)")
-    p.add_argument("--arc-port", type=str, default=None,
-                   help="serial port for ClearCore (default: /dev/ttyUSB0)")
-    p.add_argument("--cnc-port", type=str, default=None,
-                   help="serial port for GRBL CNC (default: /dev/ttyUSB1)")
+    p.add_argument("--arc-host", type=str, default=None,
+                   help="ClearCore IP address (default: 192.168.1.20)")
     p.add_argument("--bag", type=str, default=None,
                    help=".bag file for camera playback instead of live D405")
 
@@ -139,10 +137,8 @@ def main():
         config.arc_end_deg = args.arc_end
     if args.arc_step is not None:
         config.arc_step_deg = args.arc_step
-    if args.arc_port is not None:
-        config.arc_port = args.arc_port
-    if args.cnc_port is not None:
-        config.cnc_port = args.cnc_port
+    if args.arc_host is not None:
+        config.arc_host = args.arc_host
     if args.frames is not None:
         config.frames_per_position = args.frames
     if args.voxel_size is not None:

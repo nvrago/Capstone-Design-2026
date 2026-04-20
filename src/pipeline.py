@@ -68,8 +68,10 @@ class PipelineConfig:
     arc_start_deg: float = -60.0
     arc_end_deg: float = 60.0
     arc_step_deg: float = 15.0
-    arc_port: str = "/dev/ttyUSB0"
-    arc_baud: int = 115200
+    arc_host: str = "192.168.1.20"
+    arc_modbus_port: int = 502
+    arc_slave_id: int = 1
+    steps_per_degree: float = 333.33
 
     # capture
     capture_width: int = 640
@@ -91,8 +93,8 @@ class PipelineConfig:
 
     # processing
     voxel_size: float = 0.005
-    outlier_nb_neighbors: int = 20
-    outlier_std_ratio: float = 2.0
+    outlier_nb_neighbors: int = 30
+    outlier_std_ratio: float = 1.5
     normal_radius: float = 0.02
 
     # mesh
@@ -123,7 +125,7 @@ class PipelineConfig:
     gcode_dialect: str = "grbl"
 
     # cnc / grbl
-    cnc_port: str = "/dev/ttyUSB1"
+    cnc_port: str = "/dev/grbl"
     cnc_baud: int = 115200
     cnc_timeout: float = 2.0
     homing_cycle: bool = False
@@ -182,6 +184,10 @@ class PipelineConfig:
                 "serial.baud_rate": "cnc_baud",
                 "serial.timeout": "cnc_timeout",
                 "limits.homing_cycle": "homing_cycle",
+                "arc.host": "arc_host",
+                "arc.modbus_port": "arc_modbus_port",
+                "arc.slave_id": "arc_slave_id",
+                "arc.steps_per_degree": "steps_per_degree",
             },
         }
 
@@ -258,6 +264,10 @@ class ScanPipeline:
         logger.info(f"saved {filename} to {path}")
         return path
 
+    def _angle_to_steps(self, angle_deg: float) -> int:
+        """convert angle in degrees to motor steps."""
+        return int(round(angle_deg * self.config.steps_per_degree))
+
     # lifecycle
 
     def setup(self):
@@ -266,8 +276,9 @@ class ScanPipeline:
             self.arc = MockArcController()
         else:
             self.arc = ArcController(
-                port=self.config.arc_port,
-                baud=self.config.arc_baud
+                host=self.config.arc_host,
+                port=self.config.arc_modbus_port,
+                slave_id=self.config.arc_slave_id,
             )
         self.arc.connect()
 
@@ -320,7 +331,8 @@ class ScanPipeline:
         for i, angle in enumerate(positions):
             logger.info(f"position {i+1}/{len(positions)}: {angle:.1f} degrees")
 
-            self.arc.move_to(angle)
+            target_steps = self._angle_to_steps(angle)
+            self.arc.move_to_steps(target_steps)
             time.sleep(0.3)
 
             pcd = self.scanner.capture()
@@ -673,7 +685,8 @@ class ScanPipeline:
 
             clouds = []
             for angle in positions:
-                self.arc.move_to(angle)
+                target_steps = self._angle_to_steps(angle)
+                self.arc.move_to_steps(target_steps)
                 time.sleep(0.3)
                 pcd = self.scanner.capture()
                 if pcd and len(pcd.points) > 0:
