@@ -438,8 +438,6 @@ class PipelineClient(QThread):
             level = msg.get("level", "info").upper()
             text = msg.get("message", "")
             self.log_message.emit(f"[PIPE/{level}] {text}")
-        elif mtype == "capture_result":       # <-- add this branch
-            self.capture_result.emit(msg)
         elif mtype == "error":
             self.error.emit(f"[PIPE] {msg.get('message', '')}")
         elif mtype == "config_updated":
