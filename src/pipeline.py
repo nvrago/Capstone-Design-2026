@@ -95,10 +95,10 @@ class PipelineConfig:
 
     # dome filter (plate-centered geometric background removal)
     use_dome_filter: bool = True
-    dome_radius_m: float = 0.275          # inner sweep radius of arc
-    dome_arc_center_z_m: float = 0.050    # arc center height above plate
-    dome_plate_z_m: float = 0.0           # plate top z in plate coords
-    dome_tolerance_m: float = 0.00001     # shell tolerance (10 micron)
+    dome_radius_m: float = 0.273          # from dome_cloud.ply y-spread
+    dome_arc_center_z_m: float = 0.099    # from dome_cloud.ply mean z
+    dome_plate_z_m: float = -0.058        # dome skirt bottom (keep anything above)
+    dome_tolerance_m: float = 0.005       # 5mm tolerance (dome shape is approximate)
     dome_reference_path: str = "data/reference/dome_cloud.ply"
     dome_subtract_surface: bool = True    # also knn-subtract dome surface
     dome_surface_threshold_m: float = 0.003
