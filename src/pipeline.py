@@ -280,7 +280,7 @@ class PipelineConfig:
     # plate-frame box clip (outermost envelope filter).
     # sized to match plate footprint and CNC work envelope (both ~30cm),
     # with 15cm max object height.
-    plate_xy_extent_m: float = 0.60
+    plate_xy_extent_m: float = 0.060
     plate_z_min_m: float = 0.002
     plate_z_max_m: float = 0.060
 
