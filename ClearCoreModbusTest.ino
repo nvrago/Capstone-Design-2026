@@ -92,11 +92,6 @@ byte MAC_PLACEHOLDER[] = { 0x24, 0x15, 0x10, 0x00, 0x00, 0x00 };
 #define farLimit          ConnectorIO2   // "far"  side limit switch
 #define estopInput        ConnectorIO1   // emergency stop button
 
-// Discrete-capture scan parameters
-#define SCAN_STEP_STEPS    10000    // steps advanced per capture point
-#define SCAN_SETTLE_MS     150      // ring-down time after motion stops
-#define SCAN_MAX_POINTS    64       // safety cap, prevents runaway
-
 // Active level: most mechanical NC switches read LOW when pressed.
 // If yours read HIGH when triggered, change this to true.
 #define LIMIT_ACTIVE_HIGH true
@@ -122,8 +117,6 @@ typedef enum {
     CCMD_RUN_1      = 6,    // start/restart sequence 1 (back-and-forth)
     CCMD_ACK        = 7,
     CCMD_NACK       = 8
-    CCMD_NEXT_POINT  = 9    // Pi ack: capture done, advance to next point
-
 } CCMTR_CMD;
 
 // ── Controller state enum ─────────────────────────────────────────────────
@@ -150,7 +143,6 @@ struct CCMTR_STATUS {
         uint16_t estop        : 1;  // bit 4 - estop latched
         uint16_t scanning     : 1;  // bit 5 - sequence 1 running
         uint16_t hlfb         : 1;  // bit 6 - ClearPath HLFB OK (unused here)
-        uint16_t at_capture   : 1;   // bit 7 - stopped & settled, ready for capture
         uint16_t unused       : 9;
     };
     union {
@@ -182,9 +174,6 @@ struct CLIENT_INFC {
 const uint16_t NUM_REGS = sizeof(CLIENT_INFC) / 2;
 uint32_t rearmStartMs = 0;
 
-static uint32_t settleStartMs   = 0;
-static uint16_t capturePointIdx = 0;
-
 // Compile-time word-offset helper — matches offsetof/2 in Teknic reference
 #define W_ADDR(field) ((uint16_t)(offsetof(CLIENT_INFC, field) / 2))
 
@@ -206,9 +195,7 @@ enum MotionState {
     MS_IDLE,
     MS_REARM_WAIT,    // waiting for drive to come up after enable
     MS_HOMING,        // moving toward homeLimit, waiting for it to trigger
-    MS_SCAN_STEP,        // commanded a step-sized move, waiting for completion
-    MS_SETTLE,           // motion stopped, timing the ring-down
-    MS_AT_CAPTURE,       // settled, waiting for Pi CCMD_NEXT_POINT
+    MS_SCANNING,      // slow sweep from home toward farLimit
     MS_RETURNING,     // slow return from far back to homeLimit
     MS_STOPPED,
     MS_DISABLED
@@ -494,29 +481,6 @@ void handleCommand(uint16_t cmd) {
         Serial.println("[CMD] -> NONE branch");
         return;
 
-    case CCMD_NEXT_POINT:
-        if (motionState != MS_AT_CAPTURE) {
-            setMsg("NEXT_POINT ignored - not at capture");
-            regs.cmd = CCMD_NACK;
-            return;
-        }
-        // Advance one scan step from the current commanded position.
-        // farLimitHit() is checked inside serviceMotion so the step aborts
-        // cleanly if we hit the limit mid-move.
-        capturePointIdx++;
-        if (capturePointIdx >= SCAN_MAX_POINTS) {
-            setMsg("SCAN POINT CAP - returning");
-            motionState = MS_RETURNING;
-            motor.Move(-MAX_TRAVEL_STEPS, StepGenerator::MOVE_TARGET_ABSOLUTE);
-            break;
-        }
-        motor.Move(motor.PositionRefCommanded() + SCAN_STEP_STEPS,
-                   StepGenerator::MOVE_TARGET_ABSOLUTE);
-        motionState = MS_SCAN_STEP;
-        sprintf(dbg, "SCAN PT %u -> +%ld", capturePointIdx, (long)SCAN_STEP_STEPS);
-        setMsg(dbg);
-        break;
-        
     case CCMD_ENAB_MTRS:
         Serial.println("[CMD] -> ENAB branch");
         motor.EnableRequest(true);
@@ -618,11 +582,10 @@ void serviceMotion() {
     case MS_REARM_WAIT:
         if (millis() - rearmStartMs >= 2000) {
             Serial.println("[SEQ1] rearm complete, starting motion");
-            capturePointIdx = 0;
             if (homeLimitHit()) {
-                motionState = MS_SCAN_STEP;
-                motor.Move(SCAN_STEP_STEPS, StepGenerator::MOVE_TARGET_ABSOLUTE);
-                setMsg("SEQ1: already home, first step");
+                motionState = MS_SCANNING;
+                motor.Move(MAX_TRAVEL_STEPS, StepGenerator::MOVE_TARGET_ABSOLUTE);
+                setMsg("SEQ1: already home, scanning");
             } else {
                 motionState = MS_HOMING;
                 motor.Move(-MAX_TRAVEL_STEPS, StepGenerator::MOVE_TARGET_ABSOLUTE);
@@ -631,17 +594,18 @@ void serviceMotion() {
         }
         break;
 
-
     case MS_HOMING:
         // Drive toward home switch; stop the instant it trips.
         if (homeLimitHit()) {
             motor.MoveStopAbrupt();
+            // Zero our position reference here so cur_posn means something.
+            // (PositionRefSet exists on current ClearCore lib; if your
+            // version chokes on it, comment this out — sequencing still works.)
             motor.PositionRefSet(0);
-            capturePointIdx = 0;
             setMsg("HOMED - starting scan");
-            motionState = MS_SCAN_STEP;
-            motor.Move(SCAN_STEP_STEPS, StepGenerator::MOVE_TARGET_ABSOLUTE);
-        }
+            Serial.println("[SEQ1] home limit hit -> scanning");
+            motionState = MS_SCANNING;
+            motor.Move(MAX_TRAVEL_STEPS, StepGenerator::MOVE_TARGET_ABSOLUTE);
         } else if (motor.StepsComplete()) {
             // Ran out of travel without hitting the switch — bail out.
             setMsg("HOME FAIL - no limit hit");
@@ -651,8 +615,8 @@ void serviceMotion() {
         }
         break;
 
-    case MS_SCAN_STEP:
-        // Advancing one step toward far limit. Two ways to exit:
+    case MS_SCANNING:
+        // Slow sweep toward the far switch.
         if (farLimitHit()) {
             motor.MoveStopAbrupt();
             setMsg("FAR LIMIT - returning");
@@ -660,34 +624,12 @@ void serviceMotion() {
             motionState = MS_RETURNING;
             motor.Move(-MAX_TRAVEL_STEPS, StepGenerator::MOVE_TARGET_ABSOLUTE);
         } else if (motor.StepsComplete()) {
-            // Reached target; begin settle timer
-            motionState = MS_SETTLE;
-            settleStartMs = millis();
+            setMsg("SCAN FAIL - no far limit");
+            Serial.println("[SEQ1] scan FAIL");
+            motionState = MS_STOPPED;
+            regs.state  = CST_FAULT;
         }
         break;
-
-    case MS_SETTLE:
-        // Hold still long enough for mechanical ring-down to die off.
-        // Abort settle if far limit went high during ring-down (edge case).
-        if (farLimitHit()) {
-            motionState = MS_RETURNING;
-            motor.Move(-MAX_TRAVEL_STEPS, StepGenerator::MOVE_TARGET_ABSOLUTE);
-            setMsg("FAR LIMIT during settle - returning");
-            break;
-        }
-        if (millis() - settleStartMs >= SCAN_SETTLE_MS) {
-            motionState = MS_AT_CAPTURE;
-            sprintf(dbg, "AT CAPTURE pt=%u pos=%ld",
-                    capturePointIdx, (long)motor.PositionRefCommanded());
-            setMsg(dbg);
-        }
-        break;
-
-case MS_AT_CAPTURE:
-    // Nothing to do — Pi will poll status, see at_capture=1, grab
-    // averaged frames, then send CCMD_NEXT_POINT to advance. The command
-    // handler transitions us back to MS_SCAN_STEP.
-    break;
 
     case MS_RETURNING:
         // Slow return back to home, then park.
@@ -716,19 +658,20 @@ void updateStatusRegisters() {
     CCMTR_STATUS s;
     s.b.drvs_enabled = (motionState != MS_DISABLED) ? 1 : 0;
     s.b.moving       = !motor.StepsComplete() ? 1 : 0;
-    s.b.scanning     = (motionState == MS_REARM_WAIT ||
-                        motionState == MS_HOMING     ||
-                        motionState == MS_SCAN_STEP  ||
-                        motionState == MS_SETTLE     ||
-                        motionState == MS_AT_CAPTURE ||
-                        motionState == MS_RETURNING) ? 1 : 0;
-    s.b.at_capture   = (motionState == MS_AT_CAPTURE) ? 1 : 0;
+    s.b.scanning = (motionState == MS_REARM_WAIT ||
+                    motionState == MS_HOMING     ||
+                    motionState == MS_SCANNING   ||
+                    motionState == MS_RETURNING) ? 1 : 0;
     s.b.fault        = (regs.state == CST_FAULT) ? 1 : 0;
-    s.b.estop        = estopEngaged() ? 1 : 0;
-    s.b.homed        = 0;
+    s.b.estop = estopEngaged() ? 1 : 0;
+    s.b.homed = (motionState == MS_SCANNING ||
+             motionState == MS_RETURNING ||
+             (motionState == MS_STOPPED && regs.state == CST_STOPPED)) ? 1 : 0;
     s.b.hlfb         = 0;
     regs.status = s;
 
+    // Report the active target as "current position" — good enough for the
+    // comms test; watch this flip sign in the Pi log each back-and-forth cycle
     regs.cur_posn = motor.PositionRefCommanded();
 }
 
