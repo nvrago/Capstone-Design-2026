@@ -138,6 +138,98 @@ def _plate_surface_cut_adaptive(
     return pcd.select_by_index(kept.tolist())
 
 
+def _largest_component_vertices(mesh) -> np.ndarray:
+    """
+    find the largest connected component in a mesh (by triangle count)
+    and return its vertex coordinates. used to identify "the object"
+    among all mesh fragments (plate spikes produce small components,
+    the object produces one big one).
+    """
+    labels, counts, _ = mesh.mesh.cluster_connected_triangles()
+    labels = np.asarray(labels)
+    counts = np.asarray(counts)
+    if len(counts) == 0:
+        return np.asarray(mesh.mesh.vertices)
+    biggest = int(np.argmax(counts))
+    tri_mask = labels == biggest
+    tris = np.asarray(mesh.mesh.triangles)[tri_mask]
+    verts = np.asarray(mesh.mesh.vertices)
+    vert_idx = np.unique(tris.ravel())
+    return verts[vert_idx]
+
+
+def _xy_hull_with_margin(points: np.ndarray, margin_m: float) -> np.ndarray:
+    """
+    compute convex hull of the points' XY projection, then inflate
+    outward by margin_m. returns an Nx2 array of hull vertices in CCW
+    order (the inflated polygon). safe on small/degenerate inputs.
+    """
+    from scipy.spatial import ConvexHull
+    xy = points[:, :2]
+    if len(xy) < 3:
+        mn = xy.min(axis=0) - margin_m
+        mx = xy.max(axis=0) + margin_m
+        return np.array([
+            [mn[0], mn[1]],
+            [mx[0], mn[1]],
+            [mx[0], mx[1]],
+            [mn[0], mx[1]],
+        ])
+    try:
+        hull = ConvexHull(xy)
+    except Exception:
+        # scipy complains on collinear or duplicate points; fall back to bbox
+        mn = xy.min(axis=0) - margin_m
+        mx = xy.max(axis=0) + margin_m
+        return np.array([
+            [mn[0], mn[1]],
+            [mx[0], mn[1]],
+            [mx[0], mx[1]],
+            [mn[0], mx[1]],
+        ])
+    hull_pts = xy[hull.vertices]
+    # inflate outward: push each hull vertex away from the centroid
+    centroid = hull_pts.mean(axis=0)
+    directions = hull_pts - centroid
+    norms = np.linalg.norm(directions, axis=1, keepdims=True)
+    norms[norms < 1e-9] = 1.0
+    inflated = hull_pts + directions / norms * margin_m
+    return inflated
+
+
+def _clip_cloud_to_xy_polygon(
+    pcd: o3d.geometry.PointCloud,
+    polygon_xy: np.ndarray,
+) -> o3d.geometry.PointCloud:
+    """
+    drop points whose (x, y) falls outside polygon_xy. ray-casting
+    point-in-polygon test. polygon is assumed closed (last vertex
+    connects back to the first).
+    """
+    pts = np.asarray(pcd.points)
+    if len(pts) == 0:
+        return pcd
+    xy = pts[:, :2]
+    inside = np.zeros(len(xy), dtype=bool)
+    n = len(polygon_xy)
+    j = n - 1
+    for i in range(n):
+        xi, yi = polygon_xy[i]
+        xj, yj = polygon_xy[j]
+        cond = ((yi > xy[:, 1]) != (yj > xy[:, 1])) & (
+            xy[:, 0] < (xj - xi) * (xy[:, 1] - yi) / (yj - yi + 1e-12) + xi
+        )
+        inside ^= cond
+        j = i
+    kept = np.where(inside)[0]
+    removed = len(pts) - len(kept)
+    logger.info(
+        f"hull clip: removed {removed} points outside object footprint "
+        f"({100.0 * removed / len(pts):.1f}%), {len(kept)} remain"
+    )
+    return pcd.select_by_index(kept.tolist())
+
+
 @dataclass
 class PipelineConfig:
     """all tunable parameters. loaded from yaml via from_yaml()."""
@@ -180,9 +272,17 @@ class PipelineConfig:
     # fits a plane to the lowest 20% of points and cuts within this
     # distance above the plane. tighter than the static cut because
     # it adapts to actual plate height/tilt rather than assuming z~=0.
-    # 1.5mm preserves sub-5mm object features while hugging the plate.
+    # 2.5mm preserves sub-5mm object features while hugging the plate.
     plate_surface_buffer_m: float = 0.0025
     use_adaptive_plate_cut: bool = True
+
+    # object-footprint hull clip (stage 4 cleanup).
+    # after the first mesh pass, finds the largest connected component,
+    # takes its XY convex hull (with small margin), clips the processed
+    # cloud to that footprint, then re-meshes. eliminates plate-fragment
+    # residuals cleanly without touching the object.
+    use_hull_clip: bool = True
+    hull_margin_m: float = 0.003  # 3mm outward inflation, preserves edges
 
     # dome subtraction (secondary, for hemisphere / arc housing).
     # threshold is loose (50mm) so it only catches obvious hemisphere
@@ -286,6 +386,8 @@ class PipelineConfig:
                 "mesh.poisson.scale": "poisson_scale",
                 "mesh.alpha_shape.alpha": "alpha_shape_alpha",
                 "mesh.ball_pivoting.radii": "ball_pivoting_radii",
+                "mesh.hull_clip": "use_hull_clip",
+                "mesh.hull_margin_m": "hull_margin_m",
                 "toolpath.cutter.diameter": "cutter_diameter",
                 "toolpath.cutter.length": "cutter_length",
                 "toolpath.surface.stepover": "stepover",
@@ -560,7 +662,10 @@ class ScanPipeline:
     # stage 4: mesh
 
     def stage_4_mesh(self):
-        """surface reconstruction. method selectable via config.mesh_method."""
+        """surface reconstruction. method selectable via config.mesh_method.
+        with use_hull_clip, does two passes: first mesh finds the object
+        footprint, second mesh runs on the XY-clipped cloud to remove
+        plate-fragment residuals."""
         logger.info("=== stage 4: mesh ===")
         start = time.time()
 
@@ -587,12 +692,12 @@ class ScanPipeline:
 
         logger.info(f"mesh method: {method} with {kwargs}")
 
+        # first pass: mesh the processed cloud to find the object footprint
         mesh = reconstructor.reconstruct(
             self.processed_cloud,
             method=method,
             **kwargs,
         )
-
         mesh.remove_degenerate()
 
         # split pinch-point (non-manifold) vertices so separate surface
@@ -603,6 +708,48 @@ class ScanPipeline:
         mesh.split_non_manifold_vertices()
 
         mesh.remove_small_components()
+
+        # hull clip: find largest component, take XY convex hull with margin,
+        # drop any processed-cloud point outside that footprint, re-mesh.
+        # this kills plate-fragment residuals that slipped past the adaptive
+        # plate cut without risking the object itself.
+        if self.config.use_hull_clip:
+            logger.info("hull clip: extracting object footprint from first-pass mesh")
+            obj_verts = _largest_component_vertices(mesh)
+            hull_poly = _xy_hull_with_margin(
+                obj_verts,
+                margin_m=self.config.hull_margin_m,
+            )
+            logger.info(
+                f"hull clip: {len(hull_poly)} hull vertices, "
+                f"margin={self.config.hull_margin_m*1000:.1f}mm"
+            )
+
+            clipped = _clip_cloud_to_xy_polygon(
+                self.processed_cloud.pcd,
+                hull_poly,
+            )
+            self._save(clipped, "after_hull_clip.ply")
+
+            # rebuild a PointCloud wrapper so reconstructor can use it
+            clipped_pc = PointCloud(np.asarray(clipped.points))
+            if clipped.has_colors():
+                clipped_pc.pcd.colors = clipped.colors
+            if clipped.has_normals():
+                clipped_pc.pcd.normals = clipped.normals
+            else:
+                clipped_pc.estimate_normals(radius=self.config.normal_radius)
+
+            # second mesh pass on the clipped cloud
+            mesh = reconstructor.reconstruct(
+                clipped_pc,
+                method=method,
+                **kwargs,
+            )
+            mesh.remove_degenerate()
+            mesh.split_non_manifold_vertices()
+            mesh.remove_small_components()
+            logger.info(f"hull clip: re-meshed, {mesh.triangle_count} triangles")
 
         # close single-angle heightmap into a watertight solid so OCL's
         # dropcutter gets a proper closed surface to sample. runs after
