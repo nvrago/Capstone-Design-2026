@@ -526,11 +526,19 @@ class ScanPipeline:
         )
 
         mesh.remove_degenerate()
-        mesh.remove_small_components(min_ratio=0.1)
+
+        # split pinch-point (non-manifold) vertices so separate surface
+        # patches become separate components. no-op on already-manifold
+        # output (poisson). for ball_pivoting / alpha_shape, this turns
+        # false single-component meshes into the real multi-component
+        # topology, which lets remove_small_components actually do its job.
+        mesh.split_non_manifold_vertices()
+
+        mesh.remove_small_components()
 
         # close single-angle heightmap into a watertight solid so OCL's
         # dropcutter gets a proper closed surface to sample. runs after
-        # remove_small_components so the boundary is one loop.
+        # the cleanup above so the boundary is one clean loop.
         if self.config.extrude_to_plate:
             logger.info("extruding heightmap to plate (single-angle mode)")
             mesh.extrude_to_plate(plate_z=0.0)

@@ -113,21 +113,222 @@ class Mesh:
         self.mesh.remove_duplicated_vertices()
         self.mesh.remove_unreferenced_vertices()
 
-    def remove_small_components(self, min_ratio: float = 0.1):
-        """remove disconnected mesh fragments smaller than min_ratio of the largest component."""
-        triangle_clusters, cluster_n_triangles, _ = (
+    def remove_small_components(
+        self,
+        min_triangles: int = 50,
+        min_bbox_diagonal_m: float = 0.003,
+        min_ratio: float = 0.0,
+    ):
+        """remove disconnected mesh components that are too small to be
+        real geometry.
+
+        a component is kept if it meets ANY of the following thresholds:
+          - min_triangles: absolute triangle count (coarse geometry guard)
+          - min_bbox_diagonal_m: absolute physical size in meters
+            (defends against being dropped when sitting next to a
+            much larger feature — 3mm is smaller than D405 noise)
+          - min_ratio: fraction of the LARGEST component's triangle count
+            (legacy behavior; off by default now)
+
+        defaults are tuned for the D405 working envelope: 50 triangles is
+        roughly a 3-4mm feature at 2mm voxel spacing, and 3mm bbox diagonal
+        is below the D405's own accuracy floor, so anything smaller than
+        both is noise by definition.
+
+        for a single-feature scan (knife alone on plate) this behaves
+        identically to the old ratio-based filter. for a multi-feature
+        scan, smaller-but-real features are preserved.
+        """
+        triangle_clusters, cluster_n_triangles, cluster_area = (
             self.mesh.cluster_connected_triangles()
         )
         triangle_clusters = np.asarray(triangle_clusters)
         cluster_n_triangles = np.asarray(cluster_n_triangles)
-        largest = cluster_n_triangles.max()
-        threshold = int(largest * min_ratio)
-        triangles_to_remove = cluster_n_triangles[triangle_clusters] < threshold
+
+        if len(cluster_n_triangles) == 0:
+            logger.info("remove_small_components: mesh has no components")
+            return
+
+        largest = int(cluster_n_triangles.max())
+        ratio_threshold = int(largest * min_ratio) if min_ratio > 0 else 0
+
+        # compute each cluster's bbox diagonal to check the size floor
+        verts = np.asarray(self.mesh.vertices)
+        tris = np.asarray(self.mesh.triangles)
+
+        keep_cluster = np.zeros(len(cluster_n_triangles), dtype=bool)
+        for cid in range(len(cluster_n_triangles)):
+            n_tris = int(cluster_n_triangles[cid])
+            if n_tris >= min_triangles:
+                keep_cluster[cid] = True
+                continue
+            if n_tris >= ratio_threshold and ratio_threshold > 0:
+                keep_cluster[cid] = True
+                continue
+            # expensive check last: bbox diagonal of this cluster's vertices
+            mask = triangle_clusters == cid
+            if not mask.any():
+                continue
+            cluster_tris = tris[mask]
+            cluster_verts = verts[np.unique(cluster_tris.ravel())]
+            if len(cluster_verts) < 2:
+                continue
+            bbox_diag = float(
+                np.linalg.norm(cluster_verts.max(axis=0) - cluster_verts.min(axis=0))
+            )
+            if bbox_diag >= min_bbox_diagonal_m:
+                keep_cluster[cid] = True
+
+        triangles_to_remove = ~keep_cluster[triangle_clusters]
         self.mesh.remove_triangles_by_mask(triangles_to_remove)
         self.mesh.remove_unreferenced_vertices()
-        n_removed = triangles_to_remove.sum()
-        logger.info(f"removed {n_removed} triangles from small components "
-                     f"(threshold: {threshold} of {largest})")
+
+        n_kept = int(keep_cluster.sum())
+        n_dropped = len(keep_cluster) - n_kept
+        n_tris_removed = int(triangles_to_remove.sum())
+        logger.info(
+            f"remove_small_components: kept {n_kept} of "
+            f"{len(keep_cluster)} components, dropped {n_dropped} "
+            f"({n_tris_removed} triangles). thresholds: "
+            f"n_tris>={min_triangles} OR bbox_diag>={min_bbox_diagonal_m*1000:.1f}mm"
+            + (f" OR ratio>={min_ratio}" if min_ratio > 0 else "")
+        )
+
+    def split_non_manifold_vertices(self) -> 'Mesh':
+        """split pinch-point vertices so separate surface patches become
+        separate edge-connected components.
+
+        a non-manifold vertex is one where the incident triangles do not
+        form a single fan/disk but instead form two or more disjoint fans
+        that only meet at that vertex. ball pivoting on sparse clouds
+        commonly produces this: surface patches that touch at a single
+        shared vertex without sharing any edge.
+
+        the fix is standard mesh-cleanup topology surgery: for each
+        non-manifold vertex, find the distinct fans (connected components
+        of incident triangles under edge-at-that-vertex adjacency), and
+        assign all but the first fan a freshly-cloned vertex. the fans
+        become truly separate components, and downstream operations
+        (remove_small_components, boundary-loop walking, etc.) see clean
+        topology.
+
+        no-op on already-manifold meshes (poisson output, etc.), so it's
+        safe to call unconditionally as part of standard post-processing.
+
+        returns self for chaining.
+        """
+        nmv = self.mesh.get_non_manifold_vertices()
+        if len(nmv) == 0:
+            logger.info("split_non_manifold_vertices: mesh is already vertex-manifold")
+            return self
+
+        tris = np.asarray(self.mesh.triangles).copy()
+        verts = np.asarray(self.mesh.vertices).copy().tolist()
+        nmv_set = set(int(v) for v in nmv)
+
+        # build vertex -> list of incident triangle indices for all
+        # non-manifold vertices only (we only surgery these)
+        incident = {v: [] for v in nmv_set}
+        for t_idx, tri in enumerate(tris):
+            for v in tri:
+                v = int(v)
+                if v in incident:
+                    incident[v].append(t_idx)
+
+        total_splits = 0
+
+        for v in nmv_set:
+            tri_ids = incident[v]
+            if len(tri_ids) < 2:
+                continue
+
+            # build adjacency among this vertex's incident triangles.
+            # two triangles are "in the same fan" iff they share an edge
+            # that passes through v (i.e. an edge (v, other_vertex) that
+            # appears in both triangles).
+            fans = self._cluster_fans_around_vertex(v, tri_ids, tris)
+            if len(fans) <= 1:
+                continue
+
+            # keep first fan on original vertex; clone for each extra fan
+            for fan in fans[1:]:
+                new_v_idx = len(verts)
+                verts.append(list(verts[v]))
+                for t_idx in fan:
+                    # remap this triangle's reference to v -> new_v_idx
+                    for corner in range(3):
+                        if int(tris[t_idx][corner]) == v:
+                            tris[t_idx][corner] = new_v_idx
+                            break
+                total_splits += 1
+
+        # write back
+        self.mesh.vertices = o3d.utility.Vector3dVector(np.array(verts))
+        self.mesh.triangles = o3d.utility.Vector3iVector(tris)
+
+        logger.info(f"split_non_manifold_vertices: split {len(nmv_set)} pinch "
+                     f"point(s) into {len(nmv_set) + total_splits} vertices "
+                     f"(+{total_splits} new)")
+        return self
+
+    @staticmethod
+    def _cluster_fans_around_vertex(
+        v: int,
+        tri_ids: List[int],
+        tris: np.ndarray,
+    ) -> List[List[int]]:
+        """group triangles incident to vertex v into edge-connected fans.
+
+        two triangles share an "edge through v" if they both contain the
+        edge (v, w) for some other vertex w. triangles in the same fan
+        are reachable from each other through such shared edges; distinct
+        fans only meet at v itself (the pinch-point case).
+
+        returns a list of fans; each fan is a list of triangle indices.
+        a manifold vertex produces exactly one fan; a pinch point
+        produces two or more.
+        """
+        # for each incident triangle, collect its two "spoke" edges at v:
+        # the pair (v, other_a) and (v, other_b) from the triangle's
+        # other two vertices.
+        spokes = {}  # t_idx -> frozenset of the two other-vertex ids
+        for t_idx in tri_ids:
+            tri = tris[t_idx]
+            others = [int(tri[i]) for i in range(3) if int(tri[i]) != v]
+            spokes[t_idx] = frozenset(others)
+
+        # union-find over tri_ids, unioned when two triangles share a spoke
+        parent = {t: t for t in tri_ids}
+
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(a, b):
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[ra] = rb
+
+        # invert spokes: spoke-vertex -> list of triangles that use it.
+        # triangles sharing any spoke are in the same fan.
+        spoke_to_tris = {}
+        for t_idx, sp in spokes.items():
+            for w in sp:
+                spoke_to_tris.setdefault(w, []).append(t_idx)
+
+        for w, ts in spoke_to_tris.items():
+            for t in ts[1:]:
+                union(ts[0], t)
+
+        # group by root
+        groups = {}
+        for t in tri_ids:
+            r = find(t)
+            groups.setdefault(r, []).append(t)
+
+        return list(groups.values())
 
     # ---------------- extrude_to_plate helpers ----------------
 
@@ -277,6 +478,9 @@ class Mesh:
         - multiple boundary loops (outer + holes, or multiple components)
         - concave footprints (via Delaunay + point-in-polygon cull)
         - ordered boundary traversal (walls share vertices cleanly)
+
+        call split_non_manifold_vertices() + remove_small_components()
+        before this for cleanest results on ball-pivoting input.
 
         returns self for chaining.
         """
