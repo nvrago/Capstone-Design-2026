@@ -87,6 +87,7 @@ class RealSenseCapture:
         bag_file: str = None,
         arc_radius_m: float = 0.300,
         arc_center_z_m: float = 0.000,
+        filter_black_threshold: int = None,
     ):
         self.width = width
         self.height = height
@@ -100,6 +101,12 @@ class RealSenseCapture:
         # overridden with measured values.
         self.arc_radius_m = arc_radius_m
         self.arc_center_z_m = arc_center_z_m
+
+        # optional: drop near-black pixels from captured clouds (matte
+        # black background cloth, for example). per-channel threshold on
+        # 0-255 rgb; a point is removed only if r, g, and b are all
+        # below the threshold. None disables the filter entirely.
+        self.filter_black_threshold = filter_black_threshold
 
         self.pipeline = rs.pipeline()
         self.config = rs.config()
@@ -251,6 +258,23 @@ class RealSenseCapture:
         vertices = vertices[mask]
         mapped_colors = mapped_colors[mask]
 
+        # optional: drop near-black pixels (e.g. matte black background
+        # cloth). per-channel check: a point is removed only if r, g, b
+        # are all below the threshold, which protects dark-but-not-black
+        # object regions. disabled unless filter_black_threshold is set.
+        if self.filter_black_threshold is not None:
+            t = self.filter_black_threshold
+            not_black = ~np.all(mapped_colors < t, axis=1)
+            n_before = len(vertices)
+            vertices = vertices[not_black]
+            mapped_colors = mapped_colors[not_black]
+            n_removed = n_before - len(vertices)
+            pct = 100.0 * n_removed / max(n_before, 1)
+            logger.info(
+                f"black-pixel filter (threshold={t}): removed {n_removed} "
+                f"points ({pct:.1f}%), {len(vertices)} remain"
+            )
+
         # belt-and-suspenders: the threshold filter in _apply_filters zeroes
         # out invalid/out-of-range depth, but clip again at the point-cloud
         # level in case a cloud came from elsewhere (bag replay without
@@ -358,6 +382,9 @@ def main():
                         help="arc radius in meters (default 0.300)")
     parser.add_argument("--arc-center-z", type=float, default=0.000,
                         help="arc center height above plate in meters (default 0.000)")
+    parser.add_argument("--filter-black", type=int, default=None, metavar="THRESHOLD",
+                        help="drop near-black pixels (0-255). typical 30-60 for "
+                             "matte black cloth. omit to disable.")
     args = parser.parse_args()
 
     scanner = RealSenseCapture(
@@ -368,6 +395,7 @@ def main():
         bag_file=args.bag,
         arc_radius_m=args.arc_radius,
         arc_center_z_m=args.arc_center_z,
+        filter_black_threshold=args.filter_black,
     )
 
     if args.record:

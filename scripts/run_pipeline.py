@@ -10,8 +10,15 @@ full automated run, skip cnc execution:
 full run including cnc execution:
     python scripts/run_pipeline.py
 
-single-angle test at 90 deg (carriage stays still, one capture):
+single-angle test at 90 deg (carriage stays still, one capture,
+auto-selects ball_pivoting and extrudes to a solid):
     python scripts/run_pipeline.py --single-angle 90 --skip-execute --mock
+
+single-angle with near-black pixels filtered (matte cloth background):
+    python scripts/run_pipeline.py --single-angle 90 --skip-execute --mock --filter-black 40
+
+single-angle without heightmap extrusion (open-surface mesh, for debug):
+    python scripts/run_pipeline.py --single-angle 90 --skip-execute --mock --no-extrude
 
 run with mock arc (no ClearCore hardware):
     python scripts/run_pipeline.py --mock --skip-execute
@@ -94,11 +101,20 @@ def parse_args():
     p.add_argument("--single-angle", type=float, default=None,
                    help="capture a single angle only (e.g. --single-angle 90 "
                         "for overhead). overrides --arc-start/end/step. useful "
-                        "for 1D testing without carriage motion.")
+                        "for 1D testing without carriage motion. when set, "
+                        "auto-selects ball_pivoting meshing and extrudes the "
+                        "heightmap into a closed solid (use --no-extrude to "
+                        "skip the extrusion).")
 
     # capture
     p.add_argument("--frames", type=int, default=None,
                    help="frames to average per position")
+    p.add_argument("--filter-black", type=int, default=None, metavar="THRESHOLD",
+                   help="drop near-black pixels from capture (0-255). typical "
+                        "values 30-60 for matte black cloth backgrounds. omit "
+                        "to disable. per-channel: a point is removed only if "
+                        "r, g, b are ALL below the threshold, which protects "
+                        "dark-but-not-black object regions.")
 
     # processing
     p.add_argument("--voxel-size", type=float, default=None,
@@ -107,13 +123,19 @@ def parse_args():
                    help="poisson reconstruction depth")
     p.add_argument("--mesh-method", type=str, default=None,
                    choices=["poisson", "alpha_shape", "ball_pivoting"],
-                   help="mesh reconstruction method. poisson is the default and "
-                        "builds closed watertight meshes (best for full multi-angle "
-                        "scans). alpha_shape builds open surfaces (better for "
-                        "single-angle 1D tests). ball_pivoting builds surface "
-                        "strips (good for uniformly-dense clouds).")
+                   help="mesh reconstruction method. if omitted: ball_pivoting "
+                        "for --single-angle runs, poisson for full arc sweeps. "
+                        "explicit value always wins. poisson builds closed "
+                        "watertight meshes (best for full multi-angle scans). "
+                        "alpha_shape builds open surfaces (tight-fitting, may "
+                        "hole). ball_pivoting builds surface strips from "
+                        "uniformly-dense clouds.")
     p.add_argument("--alpha", type=float, default=None,
-                   help="alpha value for alpha_shape mesh method, meters (default: 0.010)")
+                   help="alpha value for alpha_shape mesh method, meters "
+                        "(default: 0.010)")
+    p.add_argument("--no-extrude", action="store_true",
+                   help="skip heightmap-to-solid extrusion in single-angle "
+                        "mode. default: extrude whenever --single-angle is set.")
     p.add_argument("--dome-threshold", type=float, default=None,
                    help="dome subtraction threshold in meters (default: 0.003)")
     p.add_argument("--plate-z-cut", type=float, default=None,
@@ -155,6 +177,22 @@ def main():
         config.arc_step_deg = 1.0
         logging.info(f"single-angle mode: capturing at {args.single_angle} deg")
 
+    # mesh method auto-selection: ball_pivoting works much better than
+    # poisson for single-angle (one-sided) captures, since poisson tries
+    # to close the surface and hallucinates the back. explicit --mesh-method
+    # always overrides this.
+    if args.mesh_method is None:
+        if args.single_angle is not None:
+            config.mesh_method = "ball_pivoting"
+            logging.info("mesh method auto-selected: ball_pivoting (single-angle)")
+        # else leave config.mesh_method at its default / yaml value (poisson)
+
+    # heightmap-to-solid extrusion: default ON for single-angle runs,
+    # OFF for full sweeps. --no-extrude forces it off.
+    config.extrude_to_plate = (
+        args.single_angle is not None and not args.no_extrude
+    )
+
     # cli overrides apply only if explicitly set, so yaml/defaults stay intact
     if args.arc_start is not None:
         config.arc_start_deg = args.arc_start
@@ -166,6 +204,8 @@ def main():
         config.arc_host = args.arc_host
     if args.frames is not None:
         config.frames_per_position = args.frames
+    if args.filter_black is not None:
+        config.filter_black_threshold = args.filter_black
     if args.voxel_size is not None:
         config.voxel_size = args.voxel_size
     if args.poisson_depth is not None:

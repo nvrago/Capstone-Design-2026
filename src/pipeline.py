@@ -5,7 +5,7 @@ stages:
     1. capture: arc sweep, D405 depth frames transformed to plate frame
     2. register: ICP merge position clouds + plate cut + dome subtract
     3. process: downsample + outlier removal + normals
-    4. mesh: poisson reconstruction
+    4. mesh: poisson reconstruction (or ball_pivoting / alpha_shape)
     5. toolpath: opencamlib + g-code writer
     6. execute: stream g-code to grbl (optional)
 
@@ -157,6 +157,16 @@ class PipelineConfig:
     # ball pivoting reconstruction (good for uniformly-dense clouds).
     # radii in meters; smallest should be ~voxel_size, largest ~3-4x.
     ball_pivoting_radii: list = field(default_factory=lambda: [0.003, 0.006, 0.012])
+    # single-angle mode: extrude the heightmap mesh into a watertight
+    # solid so OCL gets a closed surface for dropcutter. set True when
+    # only the top is scanned (one arc angle); leave False for full sweeps.
+    extrude_to_plate: bool = False
+
+    # capture-time color filtering.
+    # drop near-black pixels (e.g. matte black cloth background). per-channel:
+    # a point is removed only if r, g, b are all below this value (0-255).
+    # None disables the filter entirely.
+    filter_black_threshold: int = None
 
     # toolpath
     cutter_diameter: float = 6.0
@@ -342,6 +352,7 @@ class ScanPipeline:
             bag_file=self.config.bag_file,
             arc_radius_m=self.config.arc_radius_m,
             arc_center_z_m=self.config.arc_center_z_m,
+            filter_black_threshold=self.config.filter_black_threshold,
         )
         self.scanner.start()
         logger.info("hardware initialized")
@@ -453,7 +464,7 @@ class ScanPipeline:
 
         if self.combined_cloud is None:
             raise RuntimeError("no combined cloud, run stage 2 first")
-        
+
         if len(self.combined_cloud.points) == 0:
             raise RuntimeError(
             "combined cloud is empty. check stage 2 background removal - "
@@ -516,6 +527,14 @@ class ScanPipeline:
 
         mesh.remove_degenerate()
         mesh.remove_small_components(min_ratio=0.1)
+
+        # close single-angle heightmap into a watertight solid so OCL's
+        # dropcutter gets a proper closed surface to sample. runs after
+        # remove_small_components so the boundary is one loop.
+        if self.config.extrude_to_plate:
+            logger.info("extruding heightmap to plate (single-angle mode)")
+            mesh.extrude_to_plate(plate_z=0.0)
+
         mesh.compute_normals()
 
         self._save(mesh, "mesh.stl")
