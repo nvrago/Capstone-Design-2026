@@ -132,8 +132,8 @@ class PipelineConfig:
     # removes essentially nothing, which is correct - plate cut
     # already did the work. at 0 or 180 deg, dome subtract removes
     # the arc-housing points the camera sees at grazing angles.
-    dome_reference_path: str = "data/reference/dome_cloud_dense.ply"
-    dome_threshold_m: float = 0.050
+    dome_reference_path: str = "data/reference/dome_cloud.ply"
+    dome_threshold_m: float = 0.008
 
     # icp registration (clouds already in plate frame, so initial is identity)
     icp_voxel_size: float = 0.005
@@ -453,7 +453,12 @@ class ScanPipeline:
 
         if self.combined_cloud is None:
             raise RuntimeError("no combined cloud, run stage 2 first")
-
+        
+        if len(self.combined_cloud.points) == 0:
+            raise RuntimeError(
+            "combined cloud is empty. check stage 2 background removal - "
+            "the plate cut and dome subtract may be too aggressive."
+        )
         pcd = PointCloud(np.asarray(self.combined_cloud.points))
         if self.combined_cloud.has_colors():
             pcd.pcd.colors = self.combined_cloud.colors
