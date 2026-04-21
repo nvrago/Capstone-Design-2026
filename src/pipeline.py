@@ -123,7 +123,7 @@ class PipelineConfig:
     plate_z_max_m: float = 0.150
 
     # dome subtraction
-    dome_reference_path: str = "data/reference/dome_cloud.ply"
+    dome_reference_path: str = "data/reference/dome_cloud_dense.ply"
     dome_threshold_m: float = 0.008
 
     # plate-surface z cut (handles flat plate interior, complements dome).
