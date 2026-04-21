@@ -126,6 +126,11 @@ class PipelineConfig:
     dome_reference_path: str = "data/reference/dome_cloud.ply"
     dome_threshold_m: float = 0.008
 
+    # plate-surface z cut (handles flat plate interior, complements dome).
+    # captured plate lands at z ~= 0 with ~3mm noise, so cutting at 3mm
+    # drops it cleanly while keeping object points above.
+    plate_surface_z_cut_m: float = 0.003
+
     # icp registration (clouds already in plate frame, so initial is identity)
     icp_voxel_size: float = 0.005
     icp_max_distance: float = 0.020
