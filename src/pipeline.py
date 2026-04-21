@@ -138,25 +138,46 @@ def _plate_surface_cut_adaptive(
     return pcd.select_by_index(kept.tolist())
 
 
-def _largest_component_vertices(mesh) -> np.ndarray:
+def _object_component_vertices(mesh) -> np.ndarray:
     """
-    find the largest connected component in a mesh (by triangle count)
-    and return its vertex coordinates. used to identify "the object"
-    among all mesh fragments (plate spikes produce small components,
-    the object produces one big one).
+    identify the "object" component among all mesh fragments. picks
+    the component with the highest maximum z, since the object is
+    always taller than plate-fragment residuals (which sit near z=0
+    by construction after the plate cut).
+
+    falls back to biggest-by-triangle-count only if something fails.
     """
     labels, counts, _ = mesh.mesh.cluster_connected_triangles()
     labels = np.asarray(labels)
     counts = np.asarray(counts)
     if len(counts) == 0:
         return np.asarray(mesh.mesh.vertices)
-    biggest = int(np.argmax(counts))
-    tri_mask = labels == biggest
-    tris = np.asarray(mesh.mesh.triangles)[tri_mask]
-    verts = np.asarray(mesh.mesh.vertices)
-    vert_idx = np.unique(tris.ravel())
-    return verts[vert_idx]
 
+    verts = np.asarray(mesh.mesh.vertices)
+    tris = np.asarray(mesh.mesh.triangles)
+
+    # compute max z per component
+    max_z_per_component = np.full(len(counts), -np.inf)
+    for comp_idx in range(len(counts)):
+        tri_mask = labels == comp_idx
+        if not tri_mask.any():
+            continue
+        comp_tris = tris[tri_mask]
+        comp_vert_idx = np.unique(comp_tris.ravel())
+        comp_max_z = verts[comp_vert_idx, 2].max()
+        max_z_per_component[comp_idx] = comp_max_z
+
+    best = int(np.argmax(max_z_per_component))
+    logger.info(
+        f"object component: #{best} of {len(counts)} "
+        f"(max_z={max_z_per_component[best]*1000:.1f}mm, "
+        f"{counts[best]} triangles)"
+    )
+
+    tri_mask = labels == best
+    comp_tris = tris[tri_mask]
+    comp_vert_idx = np.unique(comp_tris.ravel())
+    return verts[comp_vert_idx]
 
 def _xy_hull_with_margin(points: np.ndarray, margin_m: float) -> np.ndarray:
     """
@@ -715,7 +736,7 @@ class ScanPipeline:
         # plate cut without risking the object itself.
         if self.config.use_hull_clip:
             logger.info("hull clip: extracting object footprint from first-pass mesh")
-            obj_verts = _largest_component_vertices(mesh)
+            obj_verts = _object_component_vertices(mesh)
             hull_poly = _xy_hull_with_margin(
                 obj_verts,
                 margin_m=self.config.hull_margin_m,
