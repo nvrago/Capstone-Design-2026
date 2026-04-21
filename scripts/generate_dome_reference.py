@@ -23,7 +23,7 @@ import os
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
-from processing.dome_filter import build_dome_reference, DOME_CLOUD_PATH
+from old.dome_filter import build_dome_reference, DOME_CLOUD_PATH
 
 
 def main():

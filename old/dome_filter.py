@@ -40,7 +40,7 @@ from processing.arc_geometry import (
     transform_plate_to_camera,
     apply_transform,
 )
-from processing.zero_mesh import subtract_zero
+from old.zero_mesh import subtract_zero
 
 logger = logging.getLogger(__name__)
 

@@ -2,16 +2,18 @@
 """
 run_pipeline.py -- CLI entry point for the scan-to-cnc pipeline
 
-full automated run (scan through gcode, skip cnc execution):
+examples:
+
+full automated run, skip cnc execution:
     python scripts/run_pipeline.py --skip-execute
 
 full run including cnc execution:
     python scripts/run_pipeline.py
 
-capture zero reference (empty plate):
-    python scripts/run_pipeline.py --zero
+single-angle test at 90 deg (carriage stays still, one capture):
+    python scripts/run_pipeline.py --single-angle 90 --skip-execute --mock
 
-run with mock arc (no hardware):
+run with mock arc (no ClearCore hardware):
     python scripts/run_pipeline.py --mock --skip-execute
 
 skip capture, process from saved clouds:
@@ -24,7 +26,7 @@ run specific stages:
     python scripts/run_pipeline.py --start-stage 3 --end-stage 4
 
 override arc positions:
-    python scripts/run_pipeline.py --arc-start -45 --arc-end 45 --arc-step 10
+    python scripts/run_pipeline.py --arc-start 0 --arc-end 180 --arc-step 15
 
 use .bag recording instead of live camera:
     python scripts/run_pipeline.py --bag data/recordings/test.bag --mock
@@ -53,12 +55,8 @@ def parse_args():
     p = argparse.ArgumentParser(
         description="scan-to-cnc automated pipeline",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__
+        epilog=__doc__,
     )
-
-    # mode
-    p.add_argument("--zero", action="store_true",
-                   help="capture zero reference (empty plate) and exit")
 
     # config
     p.add_argument("--config", "-c", type=str, default=None,
@@ -79,7 +77,8 @@ def parse_args():
 
     # hardware
     p.add_argument("--mock", action="store_true",
-                   help="use mock arc controller (no ClearCore hardware)")
+                   help="use mock arc controller (no ClearCore hardware). "
+                        "still captures live from d405 unless --bag is set.")
     p.add_argument("--arc-host", type=str, default=None,
                    help="ClearCore IP address (default: 192.168.1.20)")
     p.add_argument("--bag", type=str, default=None,
@@ -87,23 +86,27 @@ def parse_args():
 
     # arc positions
     p.add_argument("--arc-start", type=float, default=None,
-                   help="arc start angle in degrees (default: -60)")
+                   help="arc start angle in degrees")
     p.add_argument("--arc-end", type=float, default=None,
-                   help="arc end angle in degrees (default: 60)")
+                   help="arc end angle in degrees")
     p.add_argument("--arc-step", type=float, default=None,
-                   help="arc step increment in degrees (default: 15)")
+                   help="arc step increment in degrees")
+    p.add_argument("--single-angle", type=float, default=None,
+                   help="capture a single angle only (e.g. --single-angle 90 "
+                        "for overhead). overrides --arc-start/end/step. useful "
+                        "for 1D testing without carriage motion.")
 
     # capture
     p.add_argument("--frames", type=int, default=None,
-                   help="frames to average per position (default: 30)")
+                   help="frames to average per position")
 
     # processing
-    p.add_argument("--skip-zero", action="store_true",
-                   help="skip zero reference subtraction")
     p.add_argument("--voxel-size", type=float, default=None,
-                   help="voxel downsample size in meters (default: 0.005)")
+                   help="voxel downsample size in meters")
     p.add_argument("--poisson-depth", type=int, default=None,
-                   help="poisson reconstruction depth (default: 8)")
+                   help="poisson reconstruction depth")
+    p.add_argument("--dome-threshold", type=float, default=None,
+                   help="dome subtraction threshold in meters (default: 0.008)")
 
     # output
     p.add_argument("--data-dir", type=str, default=None,
@@ -122,7 +125,7 @@ def main():
     level = logging.DEBUG if args.verbose else logging.INFO
     logging.basicConfig(
         level=level,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
 
     if args.config:
@@ -130,7 +133,16 @@ def main():
     else:
         config = PipelineConfig()
 
-    # CLI args override yaml/defaults (only if explicitly set)
+    # single-angle shortcut: one capture at the specified angle.
+    # sets start = end = angle and step = 1 (any nonzero value works since
+    # arange produces a single element when end == start).
+    if args.single_angle is not None:
+        config.arc_start_deg = args.single_angle
+        config.arc_end_deg = args.single_angle
+        config.arc_step_deg = 1.0
+        logging.info(f"single-angle mode: capturing at {args.single_angle} deg")
+
+    # cli overrides apply only if explicitly set, so yaml/defaults stay intact
     if args.arc_start is not None:
         config.arc_start_deg = args.arc_start
     if args.arc_end is not None:
@@ -145,19 +157,15 @@ def main():
         config.voxel_size = args.voxel_size
     if args.poisson_depth is not None:
         config.poisson_depth = args.poisson_depth
+    if args.dome_threshold is not None:
+        config.dome_threshold_m = args.dome_threshold
     if args.data_dir is not None:
         config.data_dir = args.data_dir
 
     config.use_mock_arc = args.mock
-    config.skip_zero_subtraction = args.skip_zero
     config.bag_file = args.bag
 
     pipe = ScanPipeline(config)
-
-    if args.zero:
-        pipe.capture_zero_reference()
-        return
-
     pipe.run(
         start_stage=args.start_stage,
         end_stage=args.end_stage,

@@ -49,7 +49,7 @@ from pathlib import Path
 
 from pipeline import ScanPipeline, PipelineConfig
 from scanner.capture import RealSenseCapture
-from processing.zero_mesh import apply_zero_subtraction
+from old.zero_mesh import apply_zero_subtraction
 from processing.registration import CloudRegistrator
 
 logger = logging.getLogger(__name__)
