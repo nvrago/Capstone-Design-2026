@@ -181,7 +181,7 @@ class PipelineConfig:
     # distance above the plane. tighter than the static cut because
     # it adapts to actual plate height/tilt rather than assuming z~=0.
     # 1.5mm preserves sub-5mm object features while hugging the plate.
-    plate_surface_buffer_m: float = 0.0015
+    plate_surface_buffer_m: float = 0.0025
     use_adaptive_plate_cut: bool = True
 
     # dome subtraction (secondary, for hemisphere / arc housing).
