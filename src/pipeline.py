@@ -148,8 +148,15 @@ class PipelineConfig:
     normal_radius: float = 0.02
 
     # mesh
+    mesh_method: str = "poisson"
     poisson_depth: int = 7
     poisson_scale: float = 1.1
+    # alpha shape reconstruction (better for open surfaces / single-angle captures).
+    # smaller alpha = tighter fit. 0.01 = 10mm, tune per object scale.
+    alpha_shape_alpha: float = 0.010
+    # ball pivoting reconstruction (good for uniformly-dense clouds).
+    # radii in meters; smallest should be ~voxel_size, largest ~3-4x.
+    ball_pivoting_radii: list = field(default_factory=lambda: [0.003, 0.006, 0.012])
 
     # toolpath
     cutter_diameter: float = 6.0
@@ -204,8 +211,11 @@ class PipelineConfig:
                 "pointcloud.outlier_removal.nb_neighbors": "outlier_nb_neighbors",
                 "pointcloud.outlier_removal.std_ratio": "outlier_std_ratio",
                 "pointcloud.normal_radius": "normal_radius",
+                "mesh.method": "mesh_method",
                 "mesh.poisson.depth": "poisson_depth",
                 "mesh.poisson.scale": "poisson_scale",
+                "mesh.alpha_shape.alpha": "alpha_shape_alpha",
+                "mesh.ball_pivoting.radii": "ball_pivoting_radii",
                 "toolpath.cutter.diameter": "cutter_diameter",
                 "toolpath.cutter.length": "cutter_length",
                 "toolpath.surface.stepover": "stepover",
@@ -466,7 +476,7 @@ class ScanPipeline:
     # stage 4: mesh
 
     def stage_4_mesh(self):
-        """poisson reconstruction."""
+        """surface reconstruction. method selectable via config.mesh_method."""
         logger.info("=== stage 4: mesh ===")
         start = time.time()
 
@@ -474,11 +484,29 @@ class ScanPipeline:
             raise RuntimeError("no processed cloud, run stage 3 first")
 
         reconstructor = MeshReconstructor()
+
+        method = self.config.mesh_method
+        if method == "poisson":
+            kwargs = {
+                "depth": self.config.poisson_depth,
+                "scale": self.config.poisson_scale,
+            }
+        elif method == "alpha_shape":
+            kwargs = {"alpha": self.config.alpha_shape_alpha}
+        elif method == "ball_pivoting":
+            kwargs = {"radii": self.config.ball_pivoting_radii}
+        else:
+            raise ValueError(
+                f"unknown mesh_method '{method}'. "
+                f"use 'poisson', 'alpha_shape', or 'ball_pivoting'."
+            )
+
+        logger.info(f"mesh method: {method} with {kwargs}")
+
         mesh = reconstructor.reconstruct(
             self.processed_cloud,
-            method="poisson",
-            depth=self.config.poisson_depth,
-            scale=self.config.poisson_scale,
+            method=method,
+            **kwargs,
         )
 
         mesh.remove_degenerate()

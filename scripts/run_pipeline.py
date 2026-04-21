@@ -105,6 +105,15 @@ def parse_args():
                    help="voxel downsample size in meters")
     p.add_argument("--poisson-depth", type=int, default=None,
                    help="poisson reconstruction depth")
+    p.add_argument("--mesh-method", type=str, default=None,
+                   choices=["poisson", "alpha_shape", "ball_pivoting"],
+                   help="mesh reconstruction method. poisson is the default and "
+                        "builds closed watertight meshes (best for full multi-angle "
+                        "scans). alpha_shape builds open surfaces (better for "
+                        "single-angle 1D tests). ball_pivoting builds surface "
+                        "strips (good for uniformly-dense clouds).")
+    p.add_argument("--alpha", type=float, default=None,
+                   help="alpha value for alpha_shape mesh method, meters (default: 0.010)")
     p.add_argument("--dome-threshold", type=float, default=None,
                    help="dome subtraction threshold in meters (default: 0.003)")
     p.add_argument("--plate-z-cut", type=float, default=None,
@@ -161,6 +170,10 @@ def main():
         config.voxel_size = args.voxel_size
     if args.poisson_depth is not None:
         config.poisson_depth = args.poisson_depth
+    if args.mesh_method is not None:
+        config.mesh_method = args.mesh_method
+    if args.alpha is not None:
+        config.alpha_shape_alpha = args.alpha
     if args.dome_threshold is not None:
         config.dome_threshold_m = args.dome_threshold
     if args.plate_z_cut is not None:
