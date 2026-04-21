@@ -2,12 +2,12 @@
 pipeline.py -- main scan-to-cnc orchestrator
 
 runs the full automated sequence:
-    1. home arc, loop through positions capturing depth frames
-       (captures are transformed into plate frame at capture time
-        via capture.camera_to_plate, using arc geometry)
-    2. ICP-refine all position clouds and combine (no background
-       subtraction, the dome filter handles that in stage 1 if
-       use_dome_filter is on)
+    1. home arc, loop through positions capturing depth frames.
+       captures are transformed into plate frame at capture time via
+       capture.camera_to_plate, then box-clipped to the scanning
+       envelope (drops workbench/rig/cables).
+    2. ICP-refine all position clouds and combine, optional zero
+       subtraction.
     3. process combined cloud (downsample, outlier removal, normals)
     4. poisson mesh reconstruction
     5. toolpath generation + gcode output
@@ -26,7 +26,7 @@ data/
     runs/
         2026-04-21_013521/
             position_clouds/
-                pos_0.0.ply          # in plate frame
+                pos_0.0.ply          # in plate frame, box-clipped
                 ...
             raw_combined.ply
             after_zero_sub.ply
@@ -67,6 +67,35 @@ from arc.controller import ArcController, MockArcController
 logger = logging.getLogger(__name__)
 
 
+def _plate_frame_clip(
+    pcd: o3d.geometry.PointCloud,
+    xy_extent_m: float = 0.17,
+    z_min_m: float = -0.01,
+    z_max_m: float = 0.20,
+) -> o3d.geometry.PointCloud:
+    """
+    box clip in plate (world) frame. keeps only points inside the
+    scanning envelope: a 2*xy_extent square around the plate center,
+    from z_min (just below plate surface) to z_max (max object height).
+    drops workbench, rig, cables, and anything else outside the volume.
+
+    runs in stage 1 right after camera_to_plate, so every cloud is
+    restricted to the physical scanning volume regardless of what the
+    camera sees in the room.
+    """
+    pts = np.asarray(pcd.points)
+    if len(pts) == 0:
+        return pcd
+    mask = (
+        (np.abs(pts[:, 0]) < xy_extent_m) &
+        (np.abs(pts[:, 1]) < xy_extent_m) &
+        (pts[:, 2] > z_min_m) &
+        (pts[:, 2] < z_max_m)
+    )
+    kept = np.where(mask)[0]
+    return pcd.select_by_index(kept.tolist())
+
+
 @dataclass
 class PipelineConfig:
     """all tunable parameters for the pipeline."""
@@ -94,20 +123,29 @@ class PipelineConfig:
     decimation_magnitude: int = 2
     depth_clip_max_m: float = 0.350
 
-    # registration (arc_center / arc_axis kept for api compat but unused
-    # since clouds arrive in plate frame now; icp refines residual only)
+    # plate-frame scanning envelope clip. drops workbench/rig/cables
+    # that sit outside the working volume, regardless of what the camera
+    # sees physically. runs in stage 1 right after camera_to_plate.
+    plate_xy_extent_m: float = 0.17       # half-width of plate footprint + margin
+    plate_z_min_m: float = -0.01          # just below plate surface
+    plate_z_max_m: float = 0.20           # max expected object height
+
+    # registration. clouds arrive in plate frame already, so ICP initial
+    # transform is identity and only refines mechanical slop. threshold
+    # bumped to 20mm to tolerate the real mechanical offset between arc
+    # positions (radius / arc_center_z calibration slop).
     arc_center: list = field(default_factory=lambda: [0.0, 0.0, 0.0])
     arc_axis: list = field(default_factory=lambda: [0.0, 1.0, 0.0])
-    icp_voxel_size: float = 0.002
-    icp_max_distance: float = 0.005
+    icp_voxel_size: float = 0.005
+    icp_max_distance: float = 0.020
 
     # zero subtraction
     zero_reference_path: str = "data/reference/zero_cloud.ply"
     zero_distance_threshold: float = 0.003
 
     # dome filter (plate-centered geometric background removal).
-    # disable until the pose transform is verified with scripts/verify_pose.py,
-    # because the existing dome_filter may assume camera-frame input.
+    # disabled in favor of the plate-frame box clip in stage 1, which
+    # is simpler and runs in the same coordinate system.
     use_dome_filter: bool = False
     dome_radius_m: float = 0.273
     dome_plate_z_m: float = -0.058
@@ -116,15 +154,18 @@ class PipelineConfig:
     dome_subtract_surface: bool = True
     dome_surface_threshold_m: float = 0.003
 
-    # processing
+    # processing. outlier removal tightened (std_ratio 1.0, nb_neighbors 50)
+    # since the plate-frame clip leaves a cleaner cloud to start with.
     voxel_size: float = 0.005
-    outlier_nb_neighbors: int = 30
-    outlier_std_ratio: float = 1.5
+    outlier_nb_neighbors: int = 50
+    outlier_std_ratio: float = 1.0
     normal_radius: float = 0.02
 
-    # mesh
+    # mesh. poisson depth dropped from 8 to 7; 8 over-resolves and
+    # produces 600k+ triangles on small objects. 7 is ~40k, plenty
+    # for sub-mm detail at this scale.
     mesh_method: str = "poisson"
-    poisson_depth: int = 8
+    poisson_depth: int = 7
     poisson_width: int = 0
     poisson_scale: float = 1.1
     poisson_linear_fit: bool = False
@@ -178,6 +219,9 @@ class PipelineConfig:
                 "filters.decimation.magnitude": "decimation_magnitude",
                 "arc.radius_m": "arc_radius_m",
                 "arc.center_z_m": "arc_center_z_m",
+                "plate.xy_extent_m": "plate_xy_extent_m",
+                "plate.z_min_m": "plate_z_min_m",
+                "plate.z_max_m": "plate_z_max_m",
             },
             "processing": {
                 "pointcloud.voxel_size": "voxel_size",
@@ -295,6 +339,15 @@ class ScanPipeline:
         """convert angle in degrees to motor steps."""
         return int(round(angle_deg * self.config.steps_per_degree))
 
+    def _apply_plate_clip(self, pcd: o3d.geometry.PointCloud) -> o3d.geometry.PointCloud:
+        """apply the configured plate-frame box clip."""
+        return _plate_frame_clip(
+            pcd,
+            xy_extent_m=self.config.plate_xy_extent_m,
+            z_min_m=self.config.plate_z_min_m,
+            z_max_m=self.config.plate_z_max_m,
+        )
+
     # lifecycle
 
     def setup(self):
@@ -363,9 +416,8 @@ class ScanPipeline:
         """Capture a single depth frame at the current carriage position.
 
         The cloud is transformed into plate (world) frame at capture time
-        using the arc geometry, then (optionally) passed through the dome
-        filter for background removal, saved, and appended to
-        self.position_clouds.
+        using the arc geometry, then box-clipped to the scanning envelope,
+        saved, and appended to self.position_clouds.
         """
         self._setup_scanner_only()
 
@@ -375,15 +427,16 @@ class ScanPipeline:
         logger.info(f"capture_frame idx={index} angle={angle_deg:.1f} "
                     f"steps={target_steps}")
 
-        # capture already returns a cloud in plate frame when angle_deg is given
+        # capture returns a cloud already in plate frame when angle_deg is given
         pcd = self.scanner.capture(angle_deg=angle_deg)
         if pcd is None or len(pcd.points) == 0:
             raise RuntimeError(f"empty capture at {angle_deg:.1f} deg")
 
-        # NOTE: depth_clip_max_m is a camera-frame z-clip. with captures
-        # now in plate frame, this clip no longer corresponds to "distance
-        # from camera". leave it off in plate-frame mode.
-        # pcd = safe_crop_z(pcd, 0.0, self.config.depth_clip_max_m)
+        # plate-frame box clip: drop anything outside the scanning envelope
+        before = len(pcd.points)
+        pcd = self._apply_plate_clip(pcd)
+        logger.info(f"plate clip at {angle_deg:.1f} deg: "
+                    f"{len(pcd.points)}/{before} points kept")
 
         if self.config.use_dome_filter:
             pcd = apply_dome_filter(
@@ -426,9 +479,9 @@ class ScanPipeline:
     def stage_1_capture(self):
         """
         capture point clouds at each arc position.
-        each cloud is transformed into plate (world) frame at capture time
-        using the arc geometry, so downstream stages operate in a single
-        shared coordinate system.
+        each cloud is transformed into plate frame at capture time,
+        then box-clipped to the scanning envelope to drop anything
+        outside the working volume (workbench, rig, cables).
         """
         logger.info("=== stage 1: multi-position depth capture ===")
         start = time.time()
@@ -453,15 +506,25 @@ class ScanPipeline:
             self.arc.move_to_steps(target_steps)
             time.sleep(0.3)
 
-            # capture already returns a cloud in plate frame when angle is given
+            # capture returns a cloud already in plate frame when angle is given
             pcd = self.scanner.capture(angle_deg=angle)
 
             if pcd is None or len(pcd.points) == 0:
                 logger.warning(f"empty capture at {angle:.1f} degrees, skipping")
                 continue
 
-            # dome filter runs in plate coords; gate on the config flag until
-            # verified against the new capture frame convention.
+            # plate-frame box clip: drop anything outside the scanning envelope
+            before = len(pcd.points)
+            pcd = self._apply_plate_clip(pcd)
+            logger.info(f"plate clip at {angle:.1f} deg: "
+                        f"{len(pcd.points)}/{before} points kept")
+
+            if len(pcd.points) == 0:
+                logger.warning(f"plate clip removed all points at {angle:.1f} deg, "
+                               f"skipping")
+                continue
+
+            # dome filter (disabled by default; kept for backward compat)
             if self.config.use_dome_filter:
                 pcd = apply_dome_filter(
                     pcd,
@@ -787,7 +850,9 @@ class ScanPipeline:
 
     def capture_zero_reference(self, n_positions: int = None):
         """capture zero reference scan (empty plate, no object).
-        clouds are captured in plate frame (same as regular pipeline)."""
+        clouds are captured in plate frame and box-clipped the same
+        way regular scans are, so the reference matches what real
+        captures look like post-clip."""
         logger.info("capturing zero reference (empty plate)")
 
         self.setup()
@@ -812,10 +877,19 @@ class ScanPipeline:
                 self.arc.move_to_steps(target_steps)
                 time.sleep(0.3)
                 pcd = self.scanner.capture(angle_deg=float(angle))
-                if pcd and len(pcd.points) > 0:
+                if pcd is None or len(pcd.points) == 0:
+                    continue
+
+                # apply the same plate-frame clip regular captures get,
+                # so the zero reference occupies the same coordinate
+                # volume as the real scans it'll be subtracted from.
+                before = len(pcd.points)
+                pcd = self._apply_plate_clip(pcd)
+                logger.info(f"zero capture at {angle:.1f} deg: "
+                            f"{len(pcd.points)}/{before} points kept")
+
+                if len(pcd.points) > 0:
                     clouds.append(pcd)
-                    logger.info(f"zero capture at {angle:.1f} degrees: "
-                                 f"{len(pcd.points)} points")
 
             combined = o3d.geometry.PointCloud()
             for c in clouds:

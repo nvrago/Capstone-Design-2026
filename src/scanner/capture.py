@@ -126,9 +126,14 @@ class RealSenseCapture:
         # invalid pixels as z16 max (65535), which at depth scale 1e-4
         # becomes ~6.55m; without this filter, hole-filling treats them
         # as real depth and floods the cloud with spike artifacts.
+        #
+        # range is tuned to the actual scanning geometry: camera sits
+        # ~30cm from arc center, plate surface is ~30cm away, object top
+        # is ~22-28cm. 0.20-0.35m keeps only the working volume and
+        # drops the room/workbench/rig entirely.
         self.threshold = rs.threshold_filter()
-        self.threshold.set_option(rs.option.min_distance, 0.05)   # 5 cm
-        self.threshold.set_option(rs.option.max_distance, 0.50)   # 50 cm, d405 effective max
+        self.threshold.set_option(rs.option.min_distance, 0.20)   # 20 cm
+        self.threshold.set_option(rs.option.max_distance, 0.35)   # 35 cm
 
         self.decimation = rs.decimation_filter()
         self.decimation.set_option(rs.option.filter_magnitude, self.decimation_magnitude)
@@ -250,7 +255,7 @@ class RealSenseCapture:
         # out invalid/out-of-range depth, but clip again at the point-cloud
         # level in case a cloud came from elsewhere (bag replay without
         # filters, loaded from disk, etc).
-        valid_range = (vertices[:, 2] > 0.05) & (vertices[:, 2] < 0.50)
+        valid_range = (vertices[:, 2] > 0.20) & (vertices[:, 2] < 0.35)
         vertices = vertices[valid_range]
         mapped_colors = mapped_colors[valid_range]
 
