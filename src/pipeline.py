@@ -53,6 +53,7 @@ from processing.zero_mesh import apply_zero_subtraction
 from processing.pointcloud import PointCloud
 from processing.mesh import MeshReconstructor
 from processing.toolpath import ToolpathGenerator, CutterDef, CutterType
+from processing.o3d_safe import safe_crop_z
 from gcode.writer import GcodeWriter, GcodeConfig
 from cnc.grbl import GrblController
 from arc.controller import ArcController, MockArcController
@@ -359,12 +360,10 @@ class ScanPipeline:
         if pcd is None or len(pcd.points) == 0:
             raise RuntimeError(f"empty capture at {angle_deg:.1f} deg")
 
-        # Same depth clip as stage_1_capture uses — keep behavior consistent
-        bbox = o3d.geometry.AxisAlignedBoundingBox(
-            min_bound=np.array([-10.0, -10.0, 0.0]),
-            max_bound=np.array([10.0, 10.0, self.config.depth_clip_max_m]),
-        )
-        pcd = pcd.crop(bbox)
+        # depth clip via numpy mask. the arm64 open3d build segfaults on
+        # AxisAlignedBoundingBox construction, so safe_crop_z filters by z
+        # with a numpy mask and rebuilds the pcd contiguously.
+        pcd = safe_crop_z(pcd, 0.0, self.config.depth_clip_max_m)
 
         # Save using the same filename convention as batch mode so later
         # stages don't have to care whether captures came from stage_1 or
@@ -394,7 +393,7 @@ class ScanPipeline:
             logger.warning(f"scanner stop failed: {e}")
         self.scanner = None
         logger.info("interactive capture session ended")
-    
+
     def stage_1_capture(self):
         """
         capture point clouds at each arc position.
@@ -429,12 +428,8 @@ class ScanPipeline:
                 logger.warning(f"empty capture at {angle:.1f} degrees, skipping")
                 continue
 
-            # depth clip
-            bbox = o3d.geometry.AxisAlignedBoundingBox(
-                min_bound=np.array([-10.0, -10.0, 0.0]),
-                max_bound=np.array([10.0, 10.0, self.config.depth_clip_max_m])
-            )
-            pcd = pcd.crop(bbox)
+            # depth clip via numpy mask (see capture_frame comment above)
+            pcd = safe_crop_z(pcd, 0.0, self.config.depth_clip_max_m)
 
             self._save(pcd, f"position_clouds/pos_{angle:.1f}.ply")
             self.position_clouds.append((angle, pcd))

@@ -164,9 +164,10 @@ class ArcController:
                       pack_i32(vel) +
                       pack_i32(target_posn) +
                       [cmd_code])
-            rsp = self._client.write_registers(W_ACC, values, slave=self.slave_id)
+            # pymodbus 3.7+ renamed the slave= kwarg to device_id=
+            rsp = self._client.write_registers(W_ACC, values, device_id=self.slave_id)
         else:
-            rsp = self._client.write_register(W_CMD, cmd_code, slave=self.slave_id)
+            rsp = self._client.write_register(W_CMD, cmd_code, device_id=self.slave_id)
 
         if rsp.isError():
             raise ArcError(f"Modbus write error: {rsp}")
@@ -177,7 +178,7 @@ class ArcController:
             raise ArcError("not connected to ClearCore")
 
         rsp = self._client.read_holding_registers(
-            W_CUR_POSN, count=4, slave=self.slave_id
+            W_CUR_POSN, count=4, device_id=self.slave_id
         )
         if rsp.isError():
             raise ArcError(f"Modbus read error: {rsp}")
@@ -203,7 +204,7 @@ class ArcController:
     def read_state(self) -> int:
         """read the controller state register."""
         rsp = self._client.read_holding_registers(
-            W_STATE, count=1, slave=self.slave_id
+            W_STATE, count=1, device_id=self.slave_id
         )
         if rsp.isError():
             return CST_UNKNOWN
