@@ -54,6 +54,7 @@ from processing.pointcloud import PointCloud
 from processing.mesh import MeshReconstructor
 from processing.toolpath import ToolpathGenerator, CutterDef, CutterType
 from processing.o3d_safe import safe_crop_z
+from processing.dome_filter import apply_dome_filter, load_dome_reference
 from gcode.writer import GcodeWriter, GcodeConfig
 from cnc.grbl import GrblController
 from arc.controller import ArcController, MockArcController
@@ -91,6 +92,16 @@ class PipelineConfig:
     # zero subtraction
     zero_reference_path: str = "data/reference/zero_cloud.ply"
     zero_distance_threshold: float = 0.003
+
+    # dome filter (plate-centered geometric background removal)
+    use_dome_filter: bool = True
+    dome_radius_m: float = 0.275          # inner sweep radius of arc
+    dome_arc_center_z_m: float = 0.050    # arc center height above plate
+    dome_plate_z_m: float = 0.0           # plate top z in plate coords
+    dome_tolerance_m: float = 0.00001     # shell tolerance (10 micron)
+    dome_reference_path: str = "data/reference/dome_cloud.ply"
+    dome_subtract_surface: bool = True    # also knn-subtract dome surface
+    dome_surface_threshold_m: float = 0.003
 
     # processing
     voxel_size: float = 0.005
@@ -365,6 +376,20 @@ class ScanPipeline:
         # with a numpy mask and rebuilds the pcd contiguously.
         pcd = safe_crop_z(pcd, 0.0, self.config.depth_clip_max_m)
 
+        # plate-centered dome filter (same as stage_1_capture)
+        if self.config.use_dome_filter:
+            pcd = apply_dome_filter(
+                pcd,
+                angle_deg=angle_deg,
+                arc_radius_m=self.config.dome_radius_m,
+                arc_center_z_m=self.config.dome_arc_center_z_m,
+                dome_radius_m=self.config.dome_radius_m,
+                plate_z_m=self.config.dome_plate_z_m,
+                tolerance_m=self.config.dome_tolerance_m,
+                subtract_dome_surface=self.config.dome_subtract_surface,
+                dome_distance_threshold_m=self.config.dome_surface_threshold_m,
+            )
+
         # Save using the same filename convention as batch mode so later
         # stages don't have to care whether captures came from stage_1 or
         # from interactive capture_frame calls.
@@ -431,6 +456,22 @@ class ScanPipeline:
             # depth clip via numpy mask (see capture_frame comment above)
             pcd = safe_crop_z(pcd, 0.0, self.config.depth_clip_max_m)
 
+            # plate-centered dome filter: drops anything outside the
+            # physical arc envelope. operates in plate coords via the
+            # arc geometry, returns in camera coords.
+            if self.config.use_dome_filter:
+                pcd = apply_dome_filter(
+                    pcd,
+                    angle_deg=angle,
+                    arc_radius_m=self.config.dome_radius_m,
+                    arc_center_z_m=self.config.dome_arc_center_z_m,
+                    dome_radius_m=self.config.dome_radius_m,
+                    plate_z_m=self.config.dome_plate_z_m,
+                    tolerance_m=self.config.dome_tolerance_m,
+                    subtract_dome_surface=self.config.dome_subtract_surface,
+                    dome_distance_threshold_m=self.config.dome_surface_threshold_m,
+                )
+
             self._save(pcd, f"position_clouds/pos_{angle:.1f}.ply")
             self.position_clouds.append((angle, pcd))
             logger.info(f"captured {len(pcd.points)} points at {angle:.1f} degrees")
@@ -463,7 +504,11 @@ class ScanPipeline:
         self._save(self.combined_cloud, "raw_combined.ply")
         logger.info(f"registered cloud: {len(self.combined_cloud.points)} points")
 
-        if not self.config.skip_zero_subtraction:
+        # skip zero subtraction if the dome filter is already doing the
+        # background removal job in stage 1.
+        if self.config.use_dome_filter:
+            logger.info("dome filter active, skipping zero subtraction")
+        elif not self.config.skip_zero_subtraction:
             self.combined_cloud = apply_zero_subtraction(
                 self.combined_cloud,
                 reference_path=Path(self.config.zero_reference_path),
