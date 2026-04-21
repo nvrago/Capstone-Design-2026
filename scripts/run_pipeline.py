@@ -106,7 +106,11 @@ def parse_args():
     p.add_argument("--poisson-depth", type=int, default=None,
                    help="poisson reconstruction depth")
     p.add_argument("--dome-threshold", type=float, default=None,
-                   help="dome subtraction threshold in meters (default: 0.008)")
+                   help="dome subtraction threshold in meters (default: 0.003)")
+    p.add_argument("--plate-z-cut", type=float, default=None,
+                   help="plate surface z cut in meters (default: 0.003). "
+                        "drops all points at or below this height, cleanly "
+                        "removing the plate plane.")
 
     # output
     p.add_argument("--data-dir", type=str, default=None,
@@ -159,6 +163,8 @@ def main():
         config.poisson_depth = args.poisson_depth
     if args.dome_threshold is not None:
         config.dome_threshold_m = args.dome_threshold
+    if args.plate_z_cut is not None:
+        config.plate_surface_z_cut_m = args.plate_z_cut
     if args.data_dir is not None:
         config.data_dir = args.data_dir
 

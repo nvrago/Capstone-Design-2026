@@ -60,6 +60,35 @@ def _plate_frame_clip(
     return pcd.select_by_index(np.where(mask)[0].tolist())
 
 
+def _plate_surface_cut(
+    pcd: o3d.geometry.PointCloud,
+    z_cut_m: float,
+) -> o3d.geometry.PointCloud:
+    """
+    drop all points at or below z_cut_m (plate surface + noise).
+    captured plate lands at z ~= 0 with a few mm of noise, so a small
+    positive cutoff (e.g. 0.003m) removes it cleanly while keeping
+    everything on the object above.
+
+    this complements dome subtraction: dome handles the hemisphere/arc
+    housing at larger radii, plate_surface_cut handles the flat plate
+    interior where the object sits, avoiding the dome's 8mm threshold
+    aggressively eating thin object edges near the plate.
+    """
+    pts = np.asarray(pcd.points)
+    if len(pts) == 0:
+        return pcd
+    mask = pts[:, 2] > z_cut_m
+    kept = np.where(mask)[0]
+    removed = len(pts) - len(kept)
+    logger.info(
+        f"plate surface cut at z={z_cut_m*1000:.1f}mm: "
+        f"removed {removed} points ({100.0 * removed / len(pts):.1f}%), "
+        f"{len(kept)} remain"
+    )
+    return pcd.select_by_index(kept.tolist())
+
+
 @dataclass
 class PipelineConfig:
     """all tunable parameters. loaded from yaml via from_yaml()."""
@@ -94,7 +123,7 @@ class PipelineConfig:
     plate_z_max_m: float = 0.150
 
     # dome subtraction
-    dome_reference_path: str = "data/reference/dome_cloud_dense.ply"
+    dome_reference_path: str = "data/reference/dome_cloud.ply"
     dome_threshold_m: float = 0.008
 
     # icp registration (clouds already in plate frame, so initial is identity)
@@ -157,6 +186,7 @@ class PipelineConfig:
                 "plate.z_max_m": "plate_z_max_m",
                 "dome.reference_path": "dome_reference_path",
                 "dome.threshold_m": "dome_threshold_m",
+                "plate.surface_z_cut_m": "plate_surface_z_cut_m",
             },
             "processing": {
                 "pointcloud.voxel_size": "voxel_size",
@@ -354,8 +384,8 @@ class ScanPipeline:
     # stage 2: register + dome subtract
 
     def stage_2_register(self):
-        """icp merge position clouds, then dome subtract rig."""
-        logger.info("=== stage 2: register + dome subtract ===")
+        """icp merge position clouds, plate surface z-cut, then dome subtract."""
+        logger.info("=== stage 2: register + background removal ===")
         start = time.time()
 
         if not self.position_clouds:
@@ -372,6 +402,17 @@ class ScanPipeline:
         self._save(self.combined_cloud, "raw_combined.ply")
         logger.info(f"after icp: {len(self.combined_cloud.points)} points")
 
+        # plate surface z-cut: cleanly drop the flat plate at z~=0.
+        # does the bulk of the "remove plate" work cheaply.
+        self.combined_cloud = _plate_surface_cut(
+            self.combined_cloud,
+            z_cut_m=self.config.plate_surface_z_cut_m,
+        )
+        self._save(self.combined_cloud, "after_plate_cut.ply")
+
+        # dome subtraction: handles the hemisphere / arc housing that
+        # plate cut alone can't see. at low arc angles the camera picks
+        # up the dome structure; this removes it.
         self.combined_cloud = subtract_dome(
             self.combined_cloud,
             threshold_m=self.config.dome_threshold_m,
