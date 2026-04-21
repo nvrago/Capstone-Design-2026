@@ -26,14 +26,19 @@ protocol (JSON over TCP on localhost:5001):
         {"cmd": "status"}
         {"cmd": "stage", "stage": 3, "end": 5}
         {"cmd": "config", "key": "arc_step_deg", "value": 10.0}
-
+        {"cmd": "capture_frame", "request_id": 1, "index": 0, "angle_deg": 0.0, "target_steps": 0}
+        
     server to GUI:
         {"type": "status", "state": "idle"}
         {"type": "status", "state": "running", "stage": 2, "stage_name": "register"}
         {"type": "status", "state": "complete", "run_dir": "data/runs/..."}
-        {"type": "status", "state": "error", "message": "..."}
-        {"type": "capture_result", "request_id": 1, "index": 0, "angle_deg": 45.0, "ok": true, "point_count": 12345}
-        {"type": "log", "level": "info", "message": "..."}
+        {"type": "status", "state": "error", "message": "no device connected"}
+        {"type": "log", "level": "info", "message": "captured 12000 points"}
+        {"type": "capture_result", "request_id": 1, "ok": true, "index": 0, "angle_deg": 0.0, "point_count": 4823}
+        {"type": "capture_result", "request_id": 1, "ok": false, "index": 0, "angle_deg": 0.0, "error": "no device connected"}
+
+the GUI doesn't need to know about venvs, paths, or Python. it just
+opens a socket and sends/receives JSON lines.
 """
 
 import json
@@ -336,13 +341,20 @@ class PipelineServer:
     # autonomous pipeline commands
 
     def _run_pipeline(self, start_stage=1, end_stage=6, dry_run=False, skip_execute=False):
-        """run the full pipeline autonomously in a background thread."""
         self.state = "running"
         self._stop_requested = False
 
         try:
             logging.getLogger().addHandler(self.gui_handler)
             self.gui_handler.set_client(self.client)
+
+            # Release any interactive-session scanner before the pipeline
+            # claims the camera itself in setup()
+            if self.pipe is not None:
+                try:
+                    self.pipe.end_interactive_capture()
+                except Exception:
+                    pass
 
             self.pipe = ScanPipeline(self.config)
             self.pipe.run(
@@ -484,9 +496,80 @@ class PipelineServer:
             else:
                 self._send({"type": "error", "message": f"unknown config key: {key}"})
 
+        elif action == "capture_frame":
+            # Called from the UI between motion stops during a stepped scan.
+            # start_scan_session must have run first; self.pipe is guaranteed to exist.
+            req_id = cmd.get("request_id")
+            index = cmd.get("index")
+            angle = cmd.get("angle_deg")
+            target_steps = cmd.get("target_steps", 0)
+
+            logger.info(f"capture_frame req={req_id} idx={index} angle={angle}")
+
+            if self.pipe is None:
+                # Shouldn't happen since __init__ creates a pipe, but be safe
+                self._send({
+                "type": "capture_result",
+                    "request_id": req_id,
+                    "ok": False,
+                    "index": index,
+                    "angle_deg": angle,
+                    "error": "no active pipeline — send start_scan_session first",
+                })
+                return
+
+            try:
+                result = self.pipe.capture_frame(
+                    index=index,
+                    angle_deg=angle,
+                    target_steps=target_steps,
+                )
+                self._send({
+                    "type": "capture_result",
+                    "request_id": req_id,
+                    "ok": True,
+                    "index": index,
+                    "angle_deg": angle,
+                    **(result or {}),
+                })
+            except Exception as e:
+                logger.error(f"capture_frame failed: {e}", exc_info=True)
+                self._send({
+                    "type": "capture_result",
+                    "request_id": req_id,
+                    "ok": False,
+                    "index": index,
+                    "angle_deg": angle,
+                    "error": str(e),
+                })
+        elif action == "start_scan_session":
+            # Fresh pipeline for interactive capture. Any prior state is discarded;
+            # a subsequent pipeline "scan" command will also start fresh.
+            if self.state == "running":
+                self._send({"type": "error",
+                            "message": "cannot start scan session while pipeline is running"})
+                return
+            # Tear down the old pipeline's scanner if it was still hot, so the
+            # fresh pipeline can claim the D405 cleanly.
+            if self.pipe is not None:
+                try:
+                    self.pipe.end_interactive_capture()
+                except Exception:
+                    pass
+            self.pipe = ScanPipeline(self.config)
+            logger.info("interactive scan session started (fresh pipeline)")
+            self._send({"type": "scan_session_started"})
+
+        elif action == "end_scan_session":
+            if self.pipe is not None:
+                try:
+                    self.pipe.end_interactive_capture()
+                except Exception as e:
+                    logger.warning(f"end_scan_session cleanup: {e}")
+            self._send({"type": "scan_session_ended"})
         else:
             self._send({"type": "error", "message": f"unknown command: {action}"})
-
+        
     def serve(self):
         """start the TCP server and listen for GUI connections."""
         # start camera early so it's ready when the GUI connects
@@ -531,6 +614,7 @@ class PipelineServer:
 
 
 def main():
+    global PORT
     import argparse
 
     p = argparse.ArgumentParser(description="pipeline server for GUI")
@@ -557,7 +641,6 @@ def main():
     if args.mock:
         config.use_mock_arc = True
 
-    global PORT
     PORT = args.port
 
     server = PipelineServer(config)
