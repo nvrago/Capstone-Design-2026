@@ -335,7 +335,7 @@ class PipelineConfig:
     alpha_shape_alpha: float = 0.010
     # ball pivoting reconstruction (good for uniformly-dense clouds).
     # radii in meters; smallest should be ~voxel_size, largest ~3-4x.
-    ball_pivoting_radii: list = field(default_factory=lambda: [0.002, 0.004, 0.008])
+    ball_pivoting_radii: list = field(default_factory=lambda: [0.003, 0.006, 0.012])
     # single-angle mode: extrude the heightmap mesh into a watertight
     # solid so OCL gets a closed surface for dropcutter. set True when
     # only the top is scanned (one arc angle); leave False for full sweeps.
