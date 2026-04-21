@@ -316,7 +316,7 @@ class PipelineConfig:
 
     # icp registration (clouds already in plate frame, so initial is identity)
     icp_voxel_size: float = 0.005
-    icp_max_distance: float = 0.020
+    icp_max_distance: float = 0.05
 
     # processing. tuned for post-subtraction clouds of a few thousand points.
     # voxel 2mm preserves mm-scale detail; nb_neighbors 20 avoids over-culling

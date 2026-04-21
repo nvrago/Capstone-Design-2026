@@ -109,11 +109,21 @@ class CloudRegistrator:
         source_down = self._prepare_for_icp(source)
         target_down = self._prepare_for_icp(target)
 
+        # coarse: loose threshold absorbs residual plate-frame misalignment
+        coarse = safe_icp_point_to_plane(
+            source_down,
+            target_down,
+            self.icp_max_distance,        # now 0.05
+            initial_transform,
+            max_iterations=self.icp_max_iterations,
+        )
+
+        # fine: tight threshold, seeded from coarse result
         result = safe_icp_point_to_plane(
             source_down,
             target_down,
-            self.icp_max_distance,
-            initial_transform,
+            self.icp_max_distance * 0.1,  # 0.005
+            coarse.transformation,
             max_iterations=self.icp_max_iterations,
         )
 
