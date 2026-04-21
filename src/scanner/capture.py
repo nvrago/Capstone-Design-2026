@@ -140,7 +140,7 @@ class RealSenseCapture:
         # drops the room/workbench/rig entirely.
         self.threshold = rs.threshold_filter()
         self.threshold.set_option(rs.option.min_distance, 0.20)   # 20 cm
-        self.threshold.set_option(rs.option.max_distance, 0.35)   # 35 cm
+        self.threshold.set_option(rs.option.max_distance, 0.28)   # 35 cm
 
         self.decimation = rs.decimation_filter()
         self.decimation.set_option(rs.option.filter_magnitude, self.decimation_magnitude)
