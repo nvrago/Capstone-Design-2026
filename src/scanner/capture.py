@@ -85,7 +85,7 @@ class RealSenseCapture:
         temporal_frames: int = 15,
         decimation_magnitude: int = 2,
         bag_file: str = None,
-        arc_radius_m: float = 0.300,
+        arc_radius_m: float = 0.255,
         arc_center_z_m: float = 0.000,
         filter_black_threshold: int = None,
     ):

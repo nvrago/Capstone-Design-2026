@@ -104,7 +104,7 @@ class PipelineConfig:
     # arc geometry (plate frame, from onshape dome)
     # origin at plate-top center, +Z up, arc sweeps XZ plane.
     # verified calibration: plate frame centroid = -0.002m at 90 deg.
-    arc_radius_m: float = 0.250
+    arc_radius_m: float = 0.255
     arc_center_z_m: float = 0.000
 
     # capture
