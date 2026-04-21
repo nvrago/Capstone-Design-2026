@@ -3,6 +3,8 @@ stage 1: depth capture via intel realsense d405
 captures depth + color frames, applies temporal averaging,
 and outputs a ply point cloud for stage 2 (open3d processing).
 no gui — fully automated, headless-compatible.
+
+
 """
 
 import pyrealsense2 as rs
