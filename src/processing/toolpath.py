@@ -74,20 +74,27 @@ class ToolpathGenerator:
                    f"D={d}mm, L={length}mm")
                    
     def load_mesh(self, mesh: Mesh):
-        """Load mesh into OpenCAMLib STL surface."""
+        """Load mesh into OpenCAMLib STL surface.
+
+        mesh is in meters (scanner coordinate system); OCL and the g-code
+        writer both expect mm (standard CNC units, matches GRBL's default
+        G21 mode). scale here so the rest of the toolpath pipeline stays
+        in mm and produces mm-unit g-code directly.
+        """
         self._ocl_surface = ocl.STLSurf()
-        
-        vertices = mesh.vertices
+
+        vertices = mesh.vertices * 1000.0   # meters -> mm
         triangles = mesh.triangles
-        
+
         for tri in triangles:
             p1 = ocl.Point(*vertices[tri[0]])
             p2 = ocl.Point(*vertices[tri[1]])
             p3 = ocl.Point(*vertices[tri[2]])
             t = ocl.Triangle(p1, p2, p3)
             self._ocl_surface.addTriangle(t)
-            
-        logger.info(f"Loaded {len(triangles)} triangles into OCL surface")
+
+        logger.info(f"Loaded {len(triangles)} triangles into OCL surface "
+                     f"(scaled m -> mm)")
         
     def surface_dropcutter(self, x_min: float, x_max: float,
                            y_min: float, y_max: float,

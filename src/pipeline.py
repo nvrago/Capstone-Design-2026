@@ -562,11 +562,14 @@ class ScanPipeline:
         generator = ToolpathGenerator(cutter=cutter)
         generator.load_mesh(self.mesh)
 
+        # mesh is in meters; toolpath generator works in mm. scale bounds.
         min_bound, max_bound = self.mesh.get_bounds()
+        min_bound_mm = min_bound * 1000.0
+        max_bound_mm = max_bound * 1000.0
 
         passes = generator.surface_dropcutter(
-            x_min=min_bound[0], x_max=max_bound[0],
-            y_min=min_bound[1], y_max=max_bound[1],
+            x_min=min_bound_mm[0], x_max=max_bound_mm[0],
+            y_min=min_bound_mm[1], y_max=max_bound_mm[1],
             stepover=self.config.stepover,
             direction=self.config.surface_direction,
         )

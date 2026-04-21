@@ -6,7 +6,7 @@ Converts point clouds to triangle meshes using Open3D.
 
 import numpy as np
 import logging
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -17,6 +17,13 @@ try:
 except ImportError:
     OPEN3D_AVAILABLE = False
     logger.warning("Open3D not available")
+
+try:
+    from scipy.spatial import Delaunay
+    SCIPY_AVAILABLE = True
+except ImportError:
+    SCIPY_AVAILABLE = False
+    logger.warning("scipy not available, extrude_to_plate will fall back to fan triangulation")
 
 from .pointcloud import PointCloud
 
@@ -122,17 +129,154 @@ class Mesh:
         logger.info(f"removed {n_removed} triangles from small components "
                      f"(threshold: {threshold} of {largest})")
 
+    # ---------------- extrude_to_plate helpers ----------------
+
+    @staticmethod
+    def _find_boundary_edges(tris: np.ndarray) -> List[Tuple[int, int]]:
+        """return directed boundary edges (edges used by exactly one triangle).
+
+        winding is preserved from the original triangle that owns each edge,
+        which is what the wall-stitching code uses to choose the outward face.
+        """
+        edge_count = {}
+        edge_dir = {}
+        for tri in tris:
+            for i in range(3):
+                a, b = int(tri[i]), int(tri[(i + 1) % 3])
+                key = (min(a, b), max(a, b))
+                edge_count[key] = edge_count.get(key, 0) + 1
+                if key not in edge_dir:
+                    edge_dir[key] = (a, b)
+        return [edge_dir[k] for k, c in edge_count.items() if c == 1]
+
+    @staticmethod
+    def _walk_boundary_loops(boundary_edges: List[Tuple[int, int]]) -> List[List[int]]:
+        """walk the directed boundary edges into ordered vertex loops.
+
+        returns a list of loops; each loop is an ordered list of vertex
+        indices forming a closed polygon. one loop = outer boundary; more
+        loops = holes or multiple disconnected pieces.
+
+        robust to degenerate cases: branches (a vertex with >2 boundary
+        edges) are handled by picking an arbitrary unused edge, and
+        unreachable remainders start fresh loops.
+        """
+        # build a map: from-vertex -> list of (to-vertex) edges still available.
+        # list because a boundary vertex might connect to multiple edges in
+        # messy meshes.
+        adj = {}
+        for (a, b) in boundary_edges:
+            adj.setdefault(a, []).append(b)
+
+        loops = []
+        while adj:
+            # pick any remaining starting edge
+            start = next(iter(adj))
+            loop = [start]
+            current = start
+            while True:
+                if current not in adj or not adj[current]:
+                    # dead end (shouldn't happen on closed boundary,
+                    # but don't crash on weird inputs)
+                    break
+                nxt = adj[current].pop()
+                if not adj[current]:
+                    del adj[current]
+                if nxt == start:
+                    # loop closed
+                    break
+                loop.append(nxt)
+                current = nxt
+            if len(loop) >= 3:
+                loops.append(loop)
+        return loops
+
+    @staticmethod
+    def _triangulate_polygon_delaunay(
+        polygon_xy: np.ndarray,
+    ) -> np.ndarray:
+        """triangulate a 2D polygon via Delaunay, culling triangles whose
+        centroid falls outside the polygon.
+
+        polygon_xy: (N, 2) array of ordered boundary vertices.
+        returns: (M, 3) array of triangle indices into polygon_xy.
+
+        handles concave shapes correctly because Delaunay-over-the-hull
+        includes triangles in concave pockets which we then remove via
+        the point-in-polygon test.
+        """
+        if not SCIPY_AVAILABLE:
+            # fall back to fan triangulation from centroid
+            return Mesh._triangulate_polygon_fan(polygon_xy)
+
+        if len(polygon_xy) < 3:
+            return np.zeros((0, 3), dtype=int)
+
+        try:
+            dly = Delaunay(polygon_xy)
+        except Exception as e:
+            logger.warning(f"Delaunay failed ({e}), falling back to fan triangulation")
+            return Mesh._triangulate_polygon_fan(polygon_xy)
+
+        # cull triangles whose centroid is outside the polygon
+        tris = dly.simplices  # (M, 3) indices into polygon_xy
+        centroids = polygon_xy[tris].mean(axis=1)  # (M, 2)
+        inside = Mesh._points_in_polygon(centroids, polygon_xy)
+        return tris[inside]
+
+    @staticmethod
+    def _triangulate_polygon_fan(polygon_xy: np.ndarray) -> np.ndarray:
+        """fan triangulation from the polygon centroid. used as a fallback
+        when scipy isn't available. appends a centroid vertex and fans
+        triangles out from it; caller must handle the extra vertex.
+
+        returns triangle indices where index N (the last, appended entry)
+        refers to the centroid vertex that the caller must add.
+        """
+        n = len(polygon_xy)
+        if n < 3:
+            return np.zeros((0, 3), dtype=int)
+        centroid_idx = n  # caller must append this vertex
+        tris = np.array([
+            [centroid_idx, i, (i + 1) % n] for i in range(n)
+        ], dtype=int)
+        return tris
+
+    @staticmethod
+    def _points_in_polygon(points: np.ndarray, polygon: np.ndarray) -> np.ndarray:
+        """ray-cast point-in-polygon test. points and polygon are (N, 2)
+        and (M, 2) respectively. returns boolean array of length N.
+
+        standard even-odd crossing algorithm; handles concave polygons.
+        """
+        n = len(polygon)
+        inside = np.zeros(len(points), dtype=bool)
+        j = n - 1
+        for i in range(n):
+            xi, yi = polygon[i]
+            xj, yj = polygon[j]
+            # edge from polygon[j] to polygon[i].
+            # a horizontal ray from each point toggles inside-ness on crossing.
+            cond = ((yi > points[:, 1]) != (yj > points[:, 1])) & (
+                points[:, 0] < (xj - xi) * (points[:, 1] - yi) / (yj - yi + 1e-20) + xi
+            )
+            inside ^= cond
+            j = i
+        return inside
+
     def extrude_to_plate(self, plate_z: float = 0.0) -> 'Mesh':
         """close an open 2.5d mesh into a watertight solid by extruding its
-        boundary loop down to a flat plane at plate_z.
+        boundary loop(s) down to a flat plane at plate_z.
 
-        the top surface stays as the real scanned geometry; the walls are
-        vertical drops from every boundary vertex to plate_z; the bottom is
-        a flat cap. result is a watertight mesh suitable for OCL dropcutter.
+        top surface stays as the real scanned geometry; walls are vertical
+        drops from every boundary vertex to plate_z; bottom is a proper
+        2D Delaunay triangulation of the boundary polygon (concave-aware,
+        trimmed to the polygon footprint).
 
-        intended for single-angle captures where only the top is scanned.
-        call remove_small_components() first so the mesh is one connected
-        piece — the fan-triangulation cap assumes a single boundary loop.
+        handles:
+        - multiple boundary loops (outer + holes, or multiple components)
+        - concave footprints (via Delaunay + point-in-polygon cull)
+        - ordered boundary traversal (walls share vertices cleanly)
 
         returns self for chaining.
         """
@@ -143,26 +287,18 @@ class Mesh:
             logger.warning("extrude_to_plate: mesh has no triangles, skipping")
             return self
 
-        # find boundary edges: edges used by exactly one triangle.
-        # canonical (min, max) ordering for the count key; remember original
-        # directed (a, b) winding so wall quads stitch the right way.
-        edge_count = {}
-        edge_dir = {}
-        for tri in tris:
-            for i in range(3):
-                a, b = int(tri[i]), int(tri[(i + 1) % 3])
-                key = (min(a, b), max(a, b))
-                edge_count[key] = edge_count.get(key, 0) + 1
-                if key not in edge_dir:
-                    edge_dir[key] = (a, b)
-
-        boundary_edges = [edge_dir[k] for k, c in edge_count.items() if c == 1]
-
+        boundary_edges = self._find_boundary_edges(tris)
         if not boundary_edges:
             logger.info("extrude_to_plate: mesh is already closed, nothing to do")
             return self
 
-        logger.info(f"extrude_to_plate: found {len(boundary_edges)} boundary edges")
+        loops = self._walk_boundary_loops(boundary_edges)
+        if not loops:
+            logger.warning("extrude_to_plate: could not form boundary loops, skipping")
+            return self
+
+        logger.info(f"extrude_to_plate: {len(boundary_edges)} boundary edges "
+                     f"-> {len(loops)} loop(s)")
 
         # check which way the top mesh faces so walls and cap wind correctly
         self.mesh.compute_triangle_normals()
@@ -176,43 +312,63 @@ class Mesh:
         def get_bottom(top_idx: int) -> int:
             if top_idx not in top_to_bottom:
                 v = verts[top_idx]
-                new_verts.append([v[0], v[1], plate_z])
+                new_verts.append([float(v[0]), float(v[1]), float(plate_z)])
                 top_to_bottom[top_idx] = len(new_verts) - 1
             return top_to_bottom[top_idx]
 
-        # stitch vertical walls from each boundary edge down to plate_z
-        for (a, b) in boundary_edges:
-            a_bot = get_bottom(a)
-            b_bot = get_bottom(b)
-            if top_facing_up:
-                new_tris.append([a, b, b_bot])
-                new_tris.append([a, b_bot, a_bot])
-            else:
-                new_tris.append([a, b_bot, b])
-                new_tris.append([a, a_bot, b_bot])
-
-        # build a flat bottom cap via fan triangulation from the centroid.
-        # valid for roughly convex projected outlines; degenerate for
-        # severely concave shapes (narrow waists, C-shapes, rings).
-        bottom_indices = list(top_to_bottom.values())
-        if len(bottom_indices) >= 3:
-            bottom_pts = np.array([new_verts[i] for i in bottom_indices])
-            centroid_xy = bottom_pts[:, :2].mean(axis=0)
-            centroid_idx = len(new_verts)
-            new_verts.append([centroid_xy[0], centroid_xy[1], plate_z])
-
-            deltas = bottom_pts[:, :2] - centroid_xy
-            angles = np.arctan2(deltas[:, 1], deltas[:, 0])
-            order = np.argsort(angles)
-            ordered = [bottom_indices[i] for i in order]
-
-            for i in range(len(ordered)):
-                v1 = ordered[i]
-                v2 = ordered[(i + 1) % len(ordered)]
+        # per-loop: stitch walls and build a bottom cap
+        for loop_idx, loop in enumerate(loops):
+            # stitch walls from ordered loop. consecutive vertices in the
+            # loop are guaranteed to be connected by a boundary edge, so
+            # walls share vertices with their neighbors.
+            n = len(loop)
+            for i in range(n):
+                a = loop[i]
+                b = loop[(i + 1) % n]
+                a_bot = get_bottom(a)
+                b_bot = get_bottom(b)
                 if top_facing_up:
-                    new_tris.append([centroid_idx, v2, v1])
+                    new_tris.append([a, b, b_bot])
+                    new_tris.append([a, b_bot, a_bot])
                 else:
-                    new_tris.append([centroid_idx, v1, v2])
+                    new_tris.append([a, b_bot, b])
+                    new_tris.append([a, a_bot, b_bot])
+
+            # build the bottom cap for this loop.
+            # we triangulate the loop's XY footprint (at plate_z) via Delaunay
+            # and trim anything outside the polygon.
+            bottom_indices = [top_to_bottom[v] for v in loop]
+            polygon_xy = np.array([
+                [new_verts[i][0], new_verts[i][1]]
+                for i in bottom_indices
+            ])
+
+            if SCIPY_AVAILABLE:
+                cap_local = self._triangulate_polygon_delaunay(polygon_xy)
+                # cap_local indexes into polygon_xy (local 0..n-1);
+                # remap to the global vertex list
+                for (i, j, k) in cap_local:
+                    v1 = bottom_indices[i]
+                    v2 = bottom_indices[j]
+                    v3 = bottom_indices[k]
+                    if top_facing_up:
+                        new_tris.append([v1, v3, v2])
+                    else:
+                        new_tris.append([v1, v2, v3])
+            else:
+                # fan fallback: append centroid and fan from it
+                centroid_xy = polygon_xy.mean(axis=0)
+                centroid_idx = len(new_verts)
+                new_verts.append([float(centroid_xy[0]),
+                                   float(centroid_xy[1]),
+                                   float(plate_z)])
+                for i in range(n):
+                    v1 = bottom_indices[i]
+                    v2 = bottom_indices[(i + 1) % n]
+                    if top_facing_up:
+                        new_tris.append([centroid_idx, v2, v1])
+                    else:
+                        new_tris.append([centroid_idx, v1, v2])
 
         # write back and clean up
         self.mesh.vertices = o3d.utility.Vector3dVector(np.array(new_verts))
@@ -225,7 +381,8 @@ class Mesh:
         n_added_tris = len(new_tris) - len(tris)
         n_added_verts = len(new_verts) - len(verts)
         logger.info(f"extrude_to_plate: added {n_added_verts} bottom verts + "
-                     f"{n_added_tris} triangles. "
+                     f"{n_added_tris} triangles "
+                     f"({'Delaunay cap' if SCIPY_AVAILABLE else 'fan cap (scipy unavailable)'}). "
                      f"final: {self.vertex_count} verts, {self.triangle_count} tris")
 
         return self
