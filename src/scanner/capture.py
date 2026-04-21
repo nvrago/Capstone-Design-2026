@@ -121,6 +121,15 @@ class RealSenseCapture:
 
     def _build_filter_pipeline(self):
         """hardware post-processing filter chain."""
+        # threshold filter runs FIRST to zero out invalid / out-of-range
+        # pixels before anything else can propagate them. the d405 marks
+        # invalid pixels as z16 max (65535), which at depth scale 1e-4
+        # becomes ~6.55m; without this filter, hole-filling treats them
+        # as real depth and floods the cloud with spike artifacts.
+        self.threshold = rs.threshold_filter()
+        self.threshold.set_option(rs.option.min_distance, 0.05)   # 5 cm
+        self.threshold.set_option(rs.option.max_distance, 0.50)   # 50 cm, d405 effective max
+
         self.decimation = rs.decimation_filter()
         self.decimation.set_option(rs.option.filter_magnitude, self.decimation_magnitude)
 
@@ -138,6 +147,7 @@ class RealSenseCapture:
     def _apply_filters(self, depth_frame):
         """run depth frame through the filter chain."""
         frame = depth_frame
+        frame = self.threshold.process(frame)   # clip invalid / out-of-range first
         frame = self.decimation.process(frame)
         frame = self.spatial.process(frame)
         frame = self.temporal.process(frame)
@@ -235,6 +245,14 @@ class RealSenseCapture:
         mask = ~np.all(vertices == 0, axis=1)
         vertices = vertices[mask]
         mapped_colors = mapped_colors[mask]
+
+        # belt-and-suspenders: the threshold filter in _apply_filters zeroes
+        # out invalid/out-of-range depth, but clip again at the point-cloud
+        # level in case a cloud came from elsewhere (bag replay without
+        # filters, loaded from disk, etc).
+        valid_range = (vertices[:, 2] > 0.05) & (vertices[:, 2] < 0.50)
+        vertices = vertices[valid_range]
+        mapped_colors = mapped_colors[valid_range]
 
         logger.info(f"raw point cloud: {vertices.shape[0]} points (camera frame)")
 
