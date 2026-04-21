@@ -178,9 +178,16 @@ class RealSenseCapture:
 
         logger.info(f"raw point cloud: {vertices.shape[0]} points")
 
+        # boolean masking above produces non-contiguous views, and
+        # vertices come out as float32. the arm64 open3d build
+        # segfaults inside Vector3dVector on either condition, so
+        # force contiguous float64 before handing off.
+        vertices = np.ascontiguousarray(vertices, dtype=np.float64)
+        colors = np.ascontiguousarray(mapped_colors, dtype=np.float64) / 255.0
+
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(vertices)
-        pcd.colors = o3d.utility.Vector3dVector(mapped_colors.astype(np.float64) / 255.0)
+        pcd.colors = o3d.utility.Vector3dVector(colors)
 
         return pcd
 
