@@ -1,10 +1,9 @@
 """
 stage 1: depth capture via intel realsense d405
 captures depth + color frames, applies temporal averaging,
+transforms into plate (world) frame using arc geometry,
 and outputs a ply point cloud for stage 2 (open3d processing).
-no gui — fully automated, headless-compatible.
-
-
+no gui, fully automated, headless-compatible.
 """
 
 import pyrealsense2 as rs
@@ -15,6 +14,64 @@ import logging
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
+
+
+# camera-to-plate pose
+#
+# plate (world) frame, as defined by dome_cloud.ply from onshape:
+#   origin at arc center, on the plate bottom
+#   +Z up, perpendicular to plate
+#   arc sweeps in the world XZ plane, rotation axis is world +Y
+#   angle 0 deg: camera at (+R, 0, Z_arc), looking toward origin
+#   angle 90 deg: camera directly overhead (0, 0, Z_arc + R)
+#   angle 180 deg: camera at (-R, 0, Z_arc), looking toward origin
+#
+# camera frame (realsense convention, matches what rs.pointcloud returns):
+#   +Z forward (out of the sensor)
+#   +Y down (in image)
+#   +X right
+
+def camera_to_plate(
+    angle_deg: float,
+    arc_radius_m: float,
+    arc_center_z_m: float,
+) -> np.ndarray:
+    """
+    build the 4x4 transform that takes a point in the camera frame
+    at arc angle `angle_deg` and expresses it in the plate (world) frame.
+
+    returns a c-contiguous float64 matrix T such that
+        plate_point = T @ camera_point    (homogeneous)
+    """
+    theta = np.radians(angle_deg)
+    c, s = np.cos(theta), np.sin(theta)
+
+    # camera position in plate coords
+    cam_pos = np.array([
+        arc_radius_m * c,
+        0.0,
+        arc_center_z_m + arc_radius_m * s,
+    ], dtype=np.float64)
+
+    # camera forward (+Z) in plate coords = from camera toward arc center.
+    # at theta=0: (-1,0,0). at theta=90: (0,0,-1). at theta=180: (1,0,0).
+    forward = np.array([-c, 0.0, -s], dtype=np.float64)
+
+    # camera down (+Y) in plate coords. rotates with the arc so the
+    # image stays consistently oriented as the camera sweeps overhead.
+    # at theta=0: (0,0,-1). at theta=90: (1,0,0). at theta=180: (0,0,1).
+    down = np.array([s, 0.0, -c], dtype=np.float64)
+
+    # camera right (+X) = down x forward, right-handed.
+    right = np.cross(down, forward)
+    right = right / np.linalg.norm(right)
+
+    R = np.column_stack([right, down, forward]).astype(np.float64)
+
+    T = np.eye(4, dtype=np.float64)
+    T[:3, :3] = R
+    T[:3, 3] = cam_pos
+    return np.ascontiguousarray(T, dtype=np.float64)
 
 
 class RealSenseCapture:
@@ -28,6 +85,8 @@ class RealSenseCapture:
         temporal_frames: int = 15,
         decimation_magnitude: int = 2,
         bag_file: str = None,
+        arc_radius_m: float = 0.300,
+        arc_center_z_m: float = 0.000,
     ):
         self.width = width
         self.height = height
@@ -35,6 +94,12 @@ class RealSenseCapture:
         self.temporal_frames = temporal_frames
         self.decimation_magnitude = decimation_magnitude
         self.bag_file = bag_file
+
+        # arc geometry for camera-to-plate transform. the pipeline
+        # passes these from config; defaults are sane but should be
+        # overridden with measured values.
+        self.arc_radius_m = arc_radius_m
+        self.arc_center_z_m = arc_center_z_m
 
         self.pipeline = rs.pipeline()
         self.config = rs.config()
@@ -88,12 +153,10 @@ class RealSenseCapture:
         self.profile = self.pipeline.start(self.config)
 
         if self.bag_file:
-            # disable real-time throttling for playback
             playback = self.profile.get_device().as_playback()
             playback.set_real_time(False)
             logger.info("playback mode: real-time disabled, processing at full speed")
         else:
-            # live sensor config
             device = self.profile.get_device()
             depth_sensor = device.first_depth_sensor()
 
@@ -106,7 +169,6 @@ class RealSenseCapture:
 
         self.align = rs.align(rs.stream.depth)
 
-        # let auto-exposure stabilize (skip for .bag)
         if not self.bag_file:
             logger.info("warming up sensor (30 frames)...")
             for _ in range(30):
@@ -136,7 +198,6 @@ class RealSenseCapture:
                 logger.warning(f"frame {i}: missing depth or color, skipping")
                 continue
 
-            # each pass through temporal filter refines the estimate
             depth_frame = self._apply_filters(depth)
             color_frame = color
 
@@ -148,9 +209,9 @@ class RealSenseCapture:
 
     def frames_to_point_cloud(self, depth_frame, color_frame):
         """
-        convert aligned depth + color frames to an open3d point cloud.
-        uses realsense's built-in pointcloud computation for proper
-        intrinsic handling.
+        convert aligned depth + color frames to an open3d point cloud
+        in the camera frame. use capture(angle_deg=...) to get the cloud
+        already transformed into plate coordinates.
         """
         pc = rs.pointcloud()
         pc.map_to(color_frame)
@@ -158,8 +219,6 @@ class RealSenseCapture:
 
         vertices = np.asanyarray(points.get_vertices()).view(np.float32).reshape(-1, 3)
 
-        # decimation filter changes resolution so color array size
-        # may not match vertex count. use texture coords instead.
         tex_coords = (
             np.asanyarray(points.get_texture_coordinates())
             .view(np.float32)
@@ -171,19 +230,16 @@ class RealSenseCapture:
         v = np.clip((tex_coords[:, 1] * color_h).astype(int), 0, color_h - 1)
 
         color_image = np.asanyarray(color_frame.get_data())
-        mapped_colors = color_image[v, u][:, ::-1]  # bgr -> rgb
+        mapped_colors = color_image[v, u][:, ::-1]
 
-        # filter out zero-depth points
         mask = ~np.all(vertices == 0, axis=1)
         vertices = vertices[mask]
         mapped_colors = mapped_colors[mask]
 
-        logger.info(f"raw point cloud: {vertices.shape[0]} points")
+        logger.info(f"raw point cloud: {vertices.shape[0]} points (camera frame)")
 
-        # boolean masking above produces non-contiguous views, and
-        # vertices come out as float32. the arm64 open3d build
-        # segfaults inside Vector3dVector on either condition, so
-        # force contiguous float64 before handing off.
+        # arm64 open3d segfaults inside Vector3dVector on non-contiguous
+        # or float32 arrays. force contiguous float64 before handing off.
         vertices = np.ascontiguousarray(vertices, dtype=np.float64)
         colors = np.ascontiguousarray(mapped_colors, dtype=np.float64) / 255.0
 
@@ -193,14 +249,33 @@ class RealSenseCapture:
 
         return pcd
 
-    def capture(self, output_path: str = None):
+    def capture(self, angle_deg: float = None, output_path: str = None):
         """
         full single-view capture: frames -> temporal avg -> point cloud.
-        optionally saves to ply.
-        returns: open3d PointCloud
+
+        args:
+            angle_deg: arc angle for this capture in degrees. if provided,
+                       the returned cloud is in plate (world) coordinates.
+                       if None, cloud is returned in camera coordinates
+                       (for raw sensor debugging only, not for pipeline use).
+            output_path: optional .ply output path.
+
+        returns: open3d PointCloud. in plate frame if angle_deg was given.
         """
         depth_frame, color_frame = self.capture_averaged_frames()
         pcd = self.frames_to_point_cloud(depth_frame, color_frame)
+
+        if angle_deg is not None:
+            T = camera_to_plate(
+                angle_deg,
+                arc_radius_m=self.arc_radius_m,
+                arc_center_z_m=self.arc_center_z_m,
+            )
+            pcd.transform(T)
+            logger.info(
+                f"transformed cloud to plate frame at {angle_deg:.1f} deg "
+                f"(R={self.arc_radius_m:.3f}m, Zc={self.arc_center_z_m:.3f}m)"
+            )
 
         if output_path:
             o3d.io.write_point_cloud(output_path, pcd)
@@ -254,6 +329,12 @@ def main():
     parser.add_argument("--duration", type=float, default=5.0, help="recording duration in seconds")
     parser.add_argument("-o", "--output", type=str, default="scan_output.ply", help="output ply path")
     parser.add_argument("--frames", type=int, default=15, help="temporal averaging frame count")
+    parser.add_argument("--angle", type=float, default=None,
+                        help="arc angle in degrees (transforms cloud to plate frame)")
+    parser.add_argument("--arc-radius", type=float, default=0.300,
+                        help="arc radius in meters (default 0.300)")
+    parser.add_argument("--arc-center-z", type=float, default=0.000,
+                        help="arc center height above plate in meters (default 0.000)")
     args = parser.parse_args()
 
     scanner = RealSenseCapture(
@@ -262,17 +343,17 @@ def main():
         fps=30,
         temporal_frames=args.frames,
         bag_file=args.bag,
+        arc_radius_m=args.arc_radius,
+        arc_center_z_m=args.arc_center_z,
     )
 
-    # record mode: save .bag and exit
     if args.record:
         scanner.record_bag(args.record, duration_sec=args.duration)
         return
 
-    # capture mode: live or .bag playback
     try:
         scanner.start()
-        pcd = scanner.capture(output_path=args.output)
+        pcd = scanner.capture(angle_deg=args.angle, output_path=args.output)
         logger.info(
             f"capture complete: {len(pcd.points)} points, "
             f"saved to {args.output}"

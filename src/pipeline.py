@@ -3,7 +3,11 @@ pipeline.py -- main scan-to-cnc orchestrator
 
 runs the full automated sequence:
     1. home arc, loop through positions capturing depth frames
-    2. ICP register all position clouds + subtract zero reference
+       (captures are transformed into plate frame at capture time
+        via capture.camera_to_plate, using arc geometry)
+    2. ICP-refine all position clouds and combine (no background
+       subtraction, the dome filter handles that in stage 1 if
+       use_dome_filter is on)
     3. process combined cloud (downsample, outlier removal, normals)
     4. poisson mesh reconstruction
     5. toolpath generation + gcode output
@@ -16,12 +20,13 @@ never overwritten.
 data/
     reference/
         zero_cloud.ply
+        dome_cloud.ply
     test/
         (existing test data, untouched)
     runs/
-        2026-04-15_143022/
+        2026-04-21_013521/
             position_clouds/
-                pos_-60.0.ply
+                pos_0.0.ply          # in plate frame
                 ...
             raw_combined.ply
             after_zero_sub.ply
@@ -75,6 +80,12 @@ class PipelineConfig:
     arc_slave_id: int = 1
     steps_per_degree: float = 333.33
 
+    # arc geometry (used by capture.camera_to_plate to bring each capture
+    # into the plate/world frame defined by the onshape dome reference:
+    # origin at arc center on plate bottom, +Z up, arc sweeps in XZ plane)
+    arc_radius_m: float = 0.300           # distance camera sensor to arc center
+    arc_center_z_m: float = 0.000         # height of arc center above plate bottom
+
     # capture
     capture_width: int = 640
     capture_height: int = 480
@@ -83,7 +94,8 @@ class PipelineConfig:
     decimation_magnitude: int = 2
     depth_clip_max_m: float = 0.350
 
-    # registration
+    # registration (arc_center / arc_axis kept for api compat but unused
+    # since clouds arrive in plate frame now; icp refines residual only)
     arc_center: list = field(default_factory=lambda: [0.0, 0.0, 0.0])
     arc_axis: list = field(default_factory=lambda: [0.0, 1.0, 0.0])
     icp_voxel_size: float = 0.002
@@ -93,14 +105,15 @@ class PipelineConfig:
     zero_reference_path: str = "data/reference/zero_cloud.ply"
     zero_distance_threshold: float = 0.003
 
-    # dome filter (plate-centered geometric background removal)
-    use_dome_filter: bool = True
-    dome_radius_m: float = 0.273          # from dome_cloud.ply y-spread
-    dome_arc_center_z_m: float = 0.099    # from dome_cloud.ply mean z
-    dome_plate_z_m: float = -0.058        # dome skirt bottom (keep anything above)
-    dome_tolerance_m: float = 0.005       # 5mm tolerance (dome shape is approximate)
+    # dome filter (plate-centered geometric background removal).
+    # disable until the pose transform is verified with scripts/verify_pose.py,
+    # because the existing dome_filter may assume camera-frame input.
+    use_dome_filter: bool = False
+    dome_radius_m: float = 0.273
+    dome_plate_z_m: float = -0.058
+    dome_tolerance_m: float = 0.005
     dome_reference_path: str = "data/reference/dome_cloud.ply"
-    dome_subtract_surface: bool = True    # also knn-subtract dome surface
+    dome_subtract_surface: bool = True
     dome_surface_threshold_m: float = 0.003
 
     # processing
@@ -163,6 +176,8 @@ class PipelineConfig:
                 "streams.depth.fps": "capture_fps",
                 "filters.temporal.frames": "frames_per_position",
                 "filters.decimation.magnitude": "decimation_magnitude",
+                "arc.radius_m": "arc_radius_m",
+                "arc.center_z_m": "arc_center_z_m",
             },
             "processing": {
                 "pointcloud.voxel_size": "voxel_size",
@@ -301,6 +316,8 @@ class ScanPipeline:
             temporal_frames=self.config.frames_per_position,
             decimation_magnitude=self.config.decimation_magnitude,
             bag_file=self.config.bag_file,
+            arc_radius_m=self.config.arc_radius_m,
+            arc_center_z_m=self.config.arc_center_z_m,
         )
         self.scanner.start()
 
@@ -317,14 +334,13 @@ class ScanPipeline:
             self.arc.disconnect()
         logger.info("hardware released")
 
-    # stage 1: capture
-    # ── interactive capture (for UI-driven stepped scans) ──────────────────
+    # interactive capture (for UI-driven stepped scans)
 
     def _setup_scanner_only(self):
         """Start just the RealSense scanner. Used by interactive capture,
         where arc motion is driven externally (Pi + ClearCore via UI)."""
         if self.scanner is not None:
-            return  # already up
+            return
         self.scanner = RealSenseCapture(
             width=self.config.capture_width,
             height=self.config.capture_height,
@@ -332,6 +348,8 @@ class ScanPipeline:
             temporal_frames=self.config.frames_per_position,
             decimation_magnitude=self.config.decimation_magnitude,
             bag_file=self.config.bag_file,
+            arc_radius_m=self.config.arc_radius_m,
+            arc_center_z_m=self.config.arc_center_z_m,
         )
         self.scanner.start()
         logger.info("scanner initialized (interactive mode)")
@@ -344,45 +362,35 @@ class ScanPipeline:
     ) -> dict:
         """Capture a single depth frame at the current carriage position.
 
-        Designed to be called from server.py in response to a capture_frame
-        command from the UI during a stepped scan. The carriage motion is
-        driven externally by the UI/ClearCore; this method only handles the
-        camera side.
-
-        Saves the clipped cloud to position_clouds/pos_<angle>.ply and appends
-        (angle, pcd) to self.position_clouds so later pipeline stages
-        (register/mesh/toolpath) can consume the accumulated scan.
-
-        Raises on hard failures (scanner down, empty frame). The UI's lenient
-        policy will log + skip those angles.
+        The cloud is transformed into plate (world) frame at capture time
+        using the arc geometry, then (optionally) passed through the dome
+        filter for background removal, saved, and appended to
+        self.position_clouds.
         """
-        # Lazy scanner start on first capture
         self._setup_scanner_only()
 
-        # Lazy run_dir creation — first capture in an interactive session
-        # owns the run directory. Subsequent captures append to it.
         if self.run_dir is None:
             self._create_run_dir()
 
         logger.info(f"capture_frame idx={index} angle={angle_deg:.1f} "
                     f"steps={target_steps}")
 
-        pcd = self.scanner.capture()
+        # capture already returns a cloud in plate frame when angle_deg is given
+        pcd = self.scanner.capture(angle_deg=angle_deg)
         if pcd is None or len(pcd.points) == 0:
             raise RuntimeError(f"empty capture at {angle_deg:.1f} deg")
 
-        # depth clip via numpy mask. the arm64 open3d build segfaults on
-        # AxisAlignedBoundingBox construction, so safe_crop_z filters by z
-        # with a numpy mask and rebuilds the pcd contiguously.
-        pcd = safe_crop_z(pcd, 0.0, self.config.depth_clip_max_m)
+        # NOTE: depth_clip_max_m is a camera-frame z-clip. with captures
+        # now in plate frame, this clip no longer corresponds to "distance
+        # from camera". leave it off in plate-frame mode.
+        # pcd = safe_crop_z(pcd, 0.0, self.config.depth_clip_max_m)
 
-        # plate-centered dome filter (same as stage_1_capture)
         if self.config.use_dome_filter:
             pcd = apply_dome_filter(
                 pcd,
                 angle_deg=angle_deg,
-                arc_radius_m=self.config.dome_radius_m,
-                arc_center_z_m=self.config.dome_arc_center_z_m,
+                arc_radius_m=self.config.arc_radius_m,
+                arc_center_z_m=self.config.arc_center_z_m,
                 dome_radius_m=self.config.dome_radius_m,
                 plate_z_m=self.config.dome_plate_z_m,
                 tolerance_m=self.config.dome_tolerance_m,
@@ -390,9 +398,6 @@ class ScanPipeline:
                 dome_distance_threshold_m=self.config.dome_surface_threshold_m,
             )
 
-        # Save using the same filename convention as batch mode so later
-        # stages don't have to care whether captures came from stage_1 or
-        # from interactive capture_frame calls.
         rel_path = f"position_clouds/pos_{angle_deg:.1f}.ply"
         saved = self._save(pcd, rel_path)
 
@@ -406,10 +411,7 @@ class ScanPipeline:
         }
 
     def end_interactive_capture(self):
-        """Release the scanner after an interactive capture session.
-        Optional — the UI can call this when the stepped scan completes
-        to free USB resources. If not called, scanner stays up until
-        the server exits."""
+        """Release the scanner after an interactive capture session."""
         if self.scanner is None:
             return
         try:
@@ -419,10 +421,14 @@ class ScanPipeline:
         self.scanner = None
         logger.info("interactive capture session ended")
 
+    # stage 1: capture
+
     def stage_1_capture(self):
         """
         capture point clouds at each arc position.
-        saves each position cloud individually to position_clouds/.
+        each cloud is transformed into plate (world) frame at capture time
+        using the arc geometry, so downstream stages operate in a single
+        shared coordinate system.
         """
         logger.info("=== stage 1: multi-position depth capture ===")
         start = time.time()
@@ -447,24 +453,21 @@ class ScanPipeline:
             self.arc.move_to_steps(target_steps)
             time.sleep(0.3)
 
-            pcd = self.scanner.capture()
+            # capture already returns a cloud in plate frame when angle is given
+            pcd = self.scanner.capture(angle_deg=angle)
 
             if pcd is None or len(pcd.points) == 0:
                 logger.warning(f"empty capture at {angle:.1f} degrees, skipping")
                 continue
 
-            # depth clip via numpy mask (see capture_frame comment above)
-            pcd = safe_crop_z(pcd, 0.0, self.config.depth_clip_max_m)
-
-            # plate-centered dome filter: drops anything outside the
-            # physical arc envelope. operates in plate coords via the
-            # arc geometry, returns in camera coords.
+            # dome filter runs in plate coords; gate on the config flag until
+            # verified against the new capture frame convention.
             if self.config.use_dome_filter:
                 pcd = apply_dome_filter(
                     pcd,
                     angle_deg=angle,
-                    arc_radius_m=self.config.dome_radius_m,
-                    arc_center_z_m=self.config.dome_arc_center_z_m,
+                    arc_radius_m=self.config.arc_radius_m,
+                    arc_center_z_m=self.config.arc_center_z_m,
                     dome_radius_m=self.config.dome_radius_m,
                     plate_z_m=self.config.dome_plate_z_m,
                     tolerance_m=self.config.dome_tolerance_m,
@@ -483,7 +486,8 @@ class ScanPipeline:
     # stage 2: registration + zero subtraction
 
     def stage_2_register(self):
-        """ICP-register all position clouds, subtract zero reference."""
+        """ICP-refine all position clouds (all in plate frame), then
+        optionally subtract zero reference."""
         logger.info("=== stage 2: registration + background subtraction ===")
         start = time.time()
 
@@ -504,8 +508,6 @@ class ScanPipeline:
         self._save(self.combined_cloud, "raw_combined.ply")
         logger.info(f"registered cloud: {len(self.combined_cloud.points)} points")
 
-        # skip zero subtraction if the dome filter is already doing the
-        # background removal job in stage 1.
         if self.config.use_dome_filter:
             logger.info("dome filter active, skipping zero subtraction")
         elif not self.config.skip_zero_subtraction:
@@ -533,7 +535,6 @@ class ScanPipeline:
         if self.combined_cloud is None:
             raise RuntimeError("no combined cloud, run stage 2 first")
 
-        # wrap in PointCloud class for method access
         pcd = PointCloud(np.asarray(self.combined_cloud.points))
         if self.combined_cloud.has_colors():
             pcd.pcd.colors = self.combined_cloud.colors
@@ -730,19 +731,12 @@ class ScanPipeline:
     ):
         """
         run pipeline stages sequentially.
-
-        args:
-            start_stage: first stage to run (1-6)
-            end_stage: last stage to run (1-6)
-            dry_run: simulate cnc execution without sending gcode
-            skip_execute: stop after gcode generation (same as end_stage=5)
         """
         if skip_execute and end_stage > 5:
             end_stage = 5
 
         self._create_run_dir()
 
-        # set up file logging to run directory
         file_handler = logging.FileHandler(self.run_dir / "run.log")
         file_handler.setFormatter(logging.Formatter(
             "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
@@ -792,7 +786,8 @@ class ScanPipeline:
     # zero reference capture
 
     def capture_zero_reference(self, n_positions: int = None):
-        """capture zero reference scan (empty plate, no object)."""
+        """capture zero reference scan (empty plate, no object).
+        clouds are captured in plate frame (same as regular pipeline)."""
         logger.info("capturing zero reference (empty plate)")
 
         self.setup()
@@ -816,7 +811,7 @@ class ScanPipeline:
                 target_steps = self._angle_to_steps(angle)
                 self.arc.move_to_steps(target_steps)
                 time.sleep(0.3)
-                pcd = self.scanner.capture()
+                pcd = self.scanner.capture(angle_deg=float(angle))
                 if pcd and len(pcd.points) > 0:
                     clouds.append(pcd)
                     logger.info(f"zero capture at {angle:.1f} degrees: "
