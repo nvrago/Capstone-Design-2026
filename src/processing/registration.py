@@ -53,7 +53,7 @@ class CloudRegistrator:
         arc_center: list = None,
         arc_axis: list = None,
         voxel_size: float = 0.002,
-        icp_max_distance: float = 0.005,
+        icp_max_distance: float = 0.05,
         icp_max_iterations: int = 50,
     ):
         """
