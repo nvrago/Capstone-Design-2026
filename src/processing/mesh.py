@@ -547,20 +547,40 @@ class Mesh:
                 for i in bottom_indices
             ])
 
+            # try Delaunay first (cleaner triangulation), fall back to
+            # centroid fan if Delaunay fails (degenerate/coplanar loop)
+            # or returns indices outside the loop's vertex range.
+            delaunay_ok = False
             if SCIPY_AVAILABLE:
-                cap_local = self._triangulate_polygon_delaunay(polygon_xy)
-                # cap_local indexes into polygon_xy (local 0..n-1);
-                # remap to the global vertex list
-                for (i, j, k) in cap_local:
-                    v1 = bottom_indices[i]
-                    v2 = bottom_indices[j]
-                    v3 = bottom_indices[k]
-                    if top_facing_up:
-                        new_tris.append([v1, v3, v2])
+                try:
+                    cap_local = self._triangulate_polygon_delaunay(polygon_xy)
+                    # validate indices before using them
+                    n_local = len(polygon_xy)
+                    if all(
+                        max(i, j, k) < n_local and min(i, j, k) >= 0
+                        for (i, j, k) in cap_local
+                    ):
+                        for (i, j, k) in cap_local:
+                            v1 = bottom_indices[i]
+                            v2 = bottom_indices[j]
+                            v3 = bottom_indices[k]
+                            if top_facing_up:
+                                new_tris.append([v1, v3, v2])
+                            else:
+                                new_tris.append([v1, v2, v3])
+                        delaunay_ok = True
                     else:
-                        new_tris.append([v1, v2, v3])
-            else:
-                # fan fallback: append centroid and fan from it
+                        logger.warning(
+                            "Delaunay returned out-of-range indices, "
+                            "using fan fallback for this loop"
+                        )
+                except Exception as e:
+                    logger.warning(f"Delaunay failed ({e}), using fan fallback")
+
+            if not delaunay_ok:
+                # fan fallback: append centroid and fan from it.
+                # this handles degenerate / coplanar loops that Delaunay
+                # can't triangulate (thin objects, collinear boundary pts).
                 centroid_xy = polygon_xy.mean(axis=0)
                 centroid_idx = len(new_verts)
                 new_verts.append([float(centroid_xy[0]),
