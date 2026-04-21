@@ -88,6 +88,56 @@ def _plate_surface_cut(
     return pcd.select_by_index(kept.tolist())
 
 
+def _plate_surface_cut_adaptive(
+    pcd: o3d.geometry.PointCloud,
+    buffer_m: float,
+    bottom_fraction: float = 0.20,
+) -> o3d.geometry.PointCloud:
+    """
+    adaptive plate removal. fits a plane to the lowest bottom_fraction
+    of points (guaranteed plate since it sits below any real object),
+    then drops everything within buffer_m above the plane.
+
+    adapts to the actual plate height and tilt, so a 1.5mm buffer can
+    hug the plate tightly without caring whether the plate sits at
+    z=2mm or z=5mm on a given run. works at any arc angle, not just
+    overhead, because the plane fit follows the plate rather than
+    assuming a fixed z.
+    """
+    pts = np.asarray(pcd.points)
+    if len(pts) == 0:
+        return pcd
+
+    # take the bottom fraction by z; these are the plate
+    n = len(pts)
+    n_bottom = max(int(n * bottom_fraction), 50)
+    bottom_idx = np.argpartition(pts[:, 2], n_bottom)[:n_bottom]
+    bottom_pts = pts[bottom_idx]
+
+    # least-squares plane fit: z = a*x + b*y + c
+    # gives plane normal [-a, -b, 1] / sqrt(a^2 + b^2 + 1), offset c
+    A = np.column_stack([bottom_pts[:, 0], bottom_pts[:, 1], np.ones(n_bottom)])
+    coeffs, *_ = np.linalg.lstsq(A, bottom_pts[:, 2], rcond=None)
+    a, b, c = coeffs
+    normal = np.array([-a, -b, 1.0])
+    normal /= np.linalg.norm(normal)
+    d = -c / np.sqrt(a * a + b * b + 1.0)
+
+    # signed distance from each point to the plane, positive = above
+    dist = pts @ normal + d
+
+    mask = dist > buffer_m
+    kept = np.where(mask)[0]
+    removed = n - len(kept)
+    logger.info(
+        f"adaptive plate cut: plane tilt={np.degrees(np.arccos(normal[2])):.2f} deg, "
+        f"buffer={buffer_m*1000:.1f}mm, "
+        f"removed {removed} points ({100.0 * removed / n:.1f}%), "
+        f"{len(kept)} remain"
+    )
+    return pcd.select_by_index(kept.tolist())
+
+
 @dataclass
 class PipelineConfig:
     """all tunable parameters. loaded from yaml via from_yaml()."""
@@ -125,6 +175,14 @@ class PipelineConfig:
     # captured plate lands at z ~= 0 with ~3mm noise, so cutting at 3mm
     # drops it cleanly while keeping object points above.
     plate_surface_z_cut_m: float = 0.003
+
+    # adaptive plate cut (replaces the static z_cut above when enabled).
+    # fits a plane to the lowest 20% of points and cuts within this
+    # distance above the plane. tighter than the static cut because
+    # it adapts to actual plate height/tilt rather than assuming z~=0.
+    # 1.5mm preserves sub-5mm object features while hugging the plate.
+    plate_surface_buffer_m: float = 0.0015
+    use_adaptive_plate_cut: bool = True
 
     # dome subtraction (secondary, for hemisphere / arc housing).
     # threshold is loose (50mm) so it only catches obvious hemisphere
@@ -213,6 +271,8 @@ class PipelineConfig:
                 "plate.z_min_m": "plate_z_min_m",
                 "plate.z_max_m": "plate_z_max_m",
                 "plate.surface_z_cut_m": "plate_surface_z_cut_m",
+                "plate.surface_buffer_m": "plate_surface_buffer_m",
+                "plate.use_adaptive_cut": "use_adaptive_plate_cut",
                 "dome.reference_path": "dome_reference_path",
                 "dome.threshold_m": "dome_threshold_m",
             },
@@ -434,12 +494,20 @@ class ScanPipeline:
         self._save(self.combined_cloud, "raw_combined.ply")
         logger.info(f"after icp: {len(self.combined_cloud.points)} points")
 
-        # plate surface z-cut: primary background removal.
-        # drops the flat plate at z~=0 cleanly.
-        self.combined_cloud = _plate_surface_cut(
-            self.combined_cloud,
-            z_cut_m=self.config.plate_surface_z_cut_m,
-        )
+        # plate surface cut: primary background removal.
+        # adaptive mode fits a plane and cuts within buffer_m above it;
+        # static mode cuts at a fixed z. adaptive is the default because
+        # it hugs the plate tighter without risking object bases.
+        if self.config.use_adaptive_plate_cut:
+            self.combined_cloud = _plate_surface_cut_adaptive(
+                self.combined_cloud,
+                buffer_m=self.config.plate_surface_buffer_m,
+            )
+        else:
+            self.combined_cloud = _plate_surface_cut(
+                self.combined_cloud,
+                z_cut_m=self.config.plate_surface_z_cut_m,
+            )
         self._save(self.combined_cloud, "after_plate_cut.ply")
 
         # dome subtraction: secondary, removes hemisphere / arc housing
