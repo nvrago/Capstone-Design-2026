@@ -836,50 +836,46 @@ class ScanPipeline:
         logger.info(f"stage 4 complete: {mesh.triangle_count} triangles "
                     f"in {time.time() - start:.1f}s")
 
-    # stage 5: toolpath
+def stage_5_toolpath(self):
+    """opencamlib surface dropcutter + g-code."""
+    logger.info("=== stage 5: toolpath ===")
+    start = time.time()
 
-    def stage_5_toolpath(self):
-        """opencamlib surface dropcutter + g-code."""
-        logger.info("=== stage 5: toolpath ===")
-        start = time.time()
+    if self.mesh is None:
+        raise RuntimeError("no mesh, run stage 4 first")
 
-        if self.mesh is None:
-            raise RuntimeError("no mesh, run stage 4 first")
+    cutter = CutterDef(
+        type=CutterType("cylindrical"),
+        diameter=self.config.cutter_diameter,
+        length=self.config.cutter_length,
+    )
+    generator = ToolpathGenerator(cutter=cutter)
 
-        cutter = CutterDef(
-            type=CutterType("cylindrical"),
-            diameter=self.config.cutter_diameter,
-            length=self.config.cutter_length,
-        )
-        generator = ToolpathGenerator(cutter=cutter)
-        generator.load_mesh(self.mesh)
+    # load_mesh scales m -> mm and shifts min corner to (0,0), top to Z=0.
+    # bounds come back in mm already in the shifted coordinate space.
+    bounds = generator.load_mesh(self.mesh)
 
-        # mesh is in meters; toolpath generator works in mm. scale bounds.
-        min_bound, max_bound = self.mesh.get_bounds()
-        min_bound_mm = min_bound * 1000.0
-        max_bound_mm = max_bound * 1000.0
+    passes = generator.surface_dropcutter(
+        x_min=bounds['x'][0], x_max=bounds['x'][1],
+        y_min=bounds['y'][0], y_max=bounds['y'][1],
+        stepover=self.config.stepover,
+        direction=self.config.surface_direction,
+    )
+    passes = generator.add_lead_in_out(passes, self.config.clearance_height)
 
-        passes = generator.surface_dropcutter(
-            x_min=min_bound_mm[0], x_max=max_bound_mm[0],
-            y_min=min_bound_mm[1], y_max=max_bound_mm[1],
-            stepover=self.config.stepover,
-            direction=self.config.surface_direction,
-        )
-        passes = generator.add_lead_in_out(passes, self.config.clearance_height)
+    writer = GcodeWriter(GcodeConfig(
+        feed_rate=self.config.feed_rate,
+        plunge_rate=self.config.plunge_rate,
+        spindle_speed=self.config.spindle_speed,
+        dialect="grbl",
+    ))
+    writer.from_toolpath(passes, clearance_z=self.config.clearance_height)
 
-        writer = GcodeWriter(GcodeConfig(
-            feed_rate=self.config.feed_rate,
-            plunge_rate=self.config.plunge_rate,
-            spindle_speed=self.config.spindle_speed,
-            dialect="grbl",
-        ))
-        writer.from_toolpath(passes, clearance_z=self.config.clearance_height)
+    self.gcode_path = self.run_dir / "toolpath.gcode"
+    writer.save(str(self.gcode_path))
 
-        self.gcode_path = self.run_dir / "toolpath.gcode"
-        writer.save(str(self.gcode_path))
-
-        logger.info(f"stage 5 complete: {len(writer.lines)} lines, "
-                    f"est. {writer.estimate_time():.1f} min in {time.time() - start:.1f}s")
+    logger.info(f"stage 5 complete: {len(writer.lines)} lines, "
+                f"est. {writer.estimate_time():.1f} min in {time.time() - start:.1f}s")
 
     # stage 6: cnc execution
 
