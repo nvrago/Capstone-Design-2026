@@ -248,14 +248,13 @@ def main():
     config.use_mock_arc = args.mock
     config.bag_file = args.bag
 
-    pipe = ScanPipeline(config)
     pipe.run(
         start_stage=args.start_stage,
         end_stage=args.end_stage,
         dry_run=args.dry_run,
         skip_execute=args.skip_execute,
     )
-
+    pipe = ScanPipeline(config)
 
 if __name__ == "__main__":
     main()
