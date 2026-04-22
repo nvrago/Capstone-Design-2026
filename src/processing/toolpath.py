@@ -166,7 +166,6 @@ class ToolpathGenerator:
                 pdc.setSTL(self._ocl_surface)
                 pdc.setCutter(self._ocl_cutter)
                 pdc.setSampling(sample_step)
-                pdc.setZ(z_start)
 
                 path = ocl.Path()
                 # alternate direction each row to minimize rapid moves
@@ -201,7 +200,6 @@ class ToolpathGenerator:
                 pdc.setSTL(self._ocl_surface)
                 pdc.setCutter(self._ocl_cutter)
                 pdc.setSampling(sample_step)
-                pdc.setZ(z_start)
 
                 path = ocl.Path()
                 if i % 2 == 0:
