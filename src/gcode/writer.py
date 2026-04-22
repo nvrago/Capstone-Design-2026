@@ -265,28 +265,35 @@ class GcodeWriter:
         last_pos = [0.0, 0.0, 0.0]
 
         for line in self.lines:
-            if line.startswith('G0') or line.startswith('G1'):
-                x, y, z = last_pos
-                feed = self.config.rapid_rate if line.startswith('G0') else self.config.feed_rate
-
-                for part in line.split():
-                    if part.startswith('X'):
-                        x = float(part[1:])
-                    elif part.startswith('Y'):
-                        y = float(part[1:])
-                    elif part.startswith('Z'):
-                        z = float(part[1:])
-                    elif part.startswith('F'):
-                        feed = float(part[1:])
-
-                dx = x - last_pos[0]
-                dy = y - last_pos[1]
-                dz = z - last_pos[2]
-                dist = (dx**2 + dy**2 + dz**2) ** 0.5
-
-                if feed > 0:
-                    total_time += dist / feed
-                last_pos = [x, y, z]
+            # strip comments before parsing
+            code = line.split(';')[0].split('(')[0].strip()
+            if not (code.startswith('G0') or code.startswith('G1')):
+                continue
+            x, y, z = last_pos
+            feed = self.config.rapid_rate if code.startswith('G0') else self.config.feed_rate
+            for part in code.split():
+                if len(part) < 2:
+                    continue
+                letter, value = part[0], part[1:]
+                try:
+                    num = float(value)
+                except ValueError:
+                    continue  # malformed token, skip
+                if letter == 'X':
+                    x = num
+                elif letter == 'Y':
+                    y = num
+                elif letter == 'Z':
+                    z = num
+                elif letter == 'F':
+                    feed = num
+            dx = x - last_pos[0]
+            dy = y - last_pos[1]
+            dz = z - last_pos[2]
+            dist = (dx**2 + dy**2 + dz**2) ** 0.5
+            if feed > 0:
+                total_time += dist / feed
+            last_pos = [x, y, z]
 
         return total_time
 
