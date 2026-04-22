@@ -146,76 +146,87 @@ class ToolpathGenerator:
 
     def _dropcutter_passes(self, x_min, x_max, y_min, y_max,
                            stepover, parallel_to='x') -> List[List[ToolpathPoint]]:
-        """Generate drop cutter passes in one direction."""
+        """Generate drop cutter passes in one direction.
+
+        Uses PathDropCutter (one path per pass) instead of BatchDropCutter.
+        BatchDropCutter is broken on the ARM64 OCL build (returns start z for
+        every drop). PathDropCutter works correctly and is the recommended
+        API for line-based dropcutter operations anyway.
+        """
         passes = []
 
-        bdc = ocl.BatchDropCutter()
-        bdc.setSTL(self._ocl_surface)
-        bdc.setCutter(self._ocl_cutter)
-
-        # start rays well above the mesh so every drop has somewhere to come
-        # from. points where the ray misses the mesh come back at z_start and
-        # get filtered out below instead of emitting Z=0 plunges.
         z_start = self._ocl_surface.bb.maxpt.z + 10.0
-
         sample_step = stepover / 2  # finer sampling along cut direction
 
         if parallel_to == 'x':
             y_values = np.arange(y_min, y_max + stepover, stepover)
-            x_values = np.arange(x_min, x_max + sample_step, sample_step)
-
             for i, y in enumerate(y_values):
-                xs = x_values if i % 2 == 0 else x_values[::-1]
-                for x in xs:
-                    bdc.appendPoint(ocl.CLPoint(x, y, z_start))
-        else:
-            x_values = np.arange(x_min, x_max + stepover, stepover)
-            y_values = np.arange(y_min, y_max + sample_step, sample_step)
+                # one PathDropCutter per pass (one Y row)
+                pdc = ocl.PathDropCutter()
+                pdc.setSTL(self._ocl_surface)
+                pdc.setCutter(self._ocl_cutter)
+                pdc.setSampling(sample_step)
+                pdc.setZ(z_start)
 
-            for i, x in enumerate(x_values):
-                ys = y_values if i % 2 == 0 else y_values[::-1]
-                for y in ys:
-                    bdc.appendPoint(ocl.CLPoint(x, y, z_start))
+                path = ocl.Path()
+                # alternate direction each row to minimize rapid moves
+                if i % 2 == 0:
+                    p_start = ocl.Point(x_min, y, z_start)
+                    p_end = ocl.Point(x_max, y, z_start)
+                else:
+                    p_start = ocl.Point(x_max, y, z_start)
+                    p_end = ocl.Point(x_min, y, z_start)
+                path.append(ocl.Line(p_start, p_end))
+                pdc.setPath(path)
+                pdc.run()
 
-        bdc.run()
-
-        cl_points = bdc.getCLPoints()
-
-        current_pass = []
-        last_y = None
-        last_x = None
-
-        for clp in cl_points:
-            # ray missed the mesh entirely - end the current pass and skip
-            if abs(clp.z - z_start) < 1e-6:
+                pts = pdc.getCLPoints()
+                current_pass = []
+                for clp in pts:
+                    # missed-mesh points come back at z_start; skip them
+                    if abs(clp.z - z_start) < 1e-6:
+                        if current_pass:
+                            passes.append(current_pass)
+                            current_pass = []
+                        continue
+                    current_pass.append(ToolpathPoint(
+                        x=clp.x, y=clp.y, z=clp.z, feed_type='cut'
+                    ))
                 if current_pass:
                     passes.append(current_pass)
-                    current_pass = []
-                if parallel_to == 'x':
-                    last_y = clp.y
+        else:
+            x_values = np.arange(x_min, x_max + stepover, stepover)
+            for i, x in enumerate(x_values):
+                pdc = ocl.PathDropCutter()
+                pdc.setSTL(self._ocl_surface)
+                pdc.setCutter(self._ocl_cutter)
+                pdc.setSampling(sample_step)
+                pdc.setZ(z_start)
+
+                path = ocl.Path()
+                if i % 2 == 0:
+                    p_start = ocl.Point(x, y_min, z_start)
+                    p_end = ocl.Point(x, y_max, z_start)
                 else:
-                    last_x = clp.x
-                continue
+                    p_start = ocl.Point(x, y_max, z_start)
+                    p_end = ocl.Point(x, y_min, z_start)
+                path.append(ocl.Line(p_start, p_end))
+                pdc.setPath(path)
+                pdc.run()
 
-            pt = ToolpathPoint(x=clp.x, y=clp.y, z=clp.z, feed_type='cut')
-
-            if parallel_to == 'x':
-                if last_y is not None and abs(clp.y - last_y) > stepover * 0.9:
-                    if current_pass:
-                        passes.append(current_pass)
-                    current_pass = []
-                last_y = clp.y
-            else:
-                if last_x is not None and abs(clp.x - last_x) > stepover * 0.9:
-                    if current_pass:
-                        passes.append(current_pass)
-                    current_pass = []
-                last_x = clp.x
-
-            current_pass.append(pt)
-
-        if current_pass:
-            passes.append(current_pass)
+                pts = pdc.getCLPoints()
+                current_pass = []
+                for clp in pts:
+                    if abs(clp.z - z_start) < 1e-6:
+                        if current_pass:
+                            passes.append(current_pass)
+                            current_pass = []
+                        continue
+                    current_pass.append(ToolpathPoint(
+                        x=clp.x, y=clp.y, z=clp.z, feed_type='cut'
+                    ))
+                if current_pass:
+                    passes.append(current_pass)
 
         logger.info(f"Generated {len(passes)} {parallel_to}-direction passes")
         return passes
