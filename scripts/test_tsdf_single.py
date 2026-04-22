@@ -116,8 +116,23 @@ def capture_one_rgbd(width=640, height=480, fps=30, warmup_frames=30,
     depth_sensor = profile.get_device().first_depth_sensor()
     depth_sensor.set_option(rs.option.visual_preset, 3)  # high accuracy
     if laser_power is not None:
-        depth_sensor.set_option(rs.option.laser_power, laser_power)
-        logger.info(f"laser power set to {laser_power} mW")
+        # try several option names since names vary by device.
+        # d405 typically exposes 'projector_power'; older devices use 'laser_power'.
+        candidates = []
+        for opt_name in ('projector_power', 'laser_power'):
+            opt = getattr(rs.option, opt_name, None)
+            if opt is not None and depth_sensor.supports(opt):
+                candidates.append((opt_name, opt))
+        if not candidates:
+            # log every supported option to help diagnose
+            supported = [str(o) for o in dir(rs.option) if not o.startswith('_')
+                         and depth_sensor.supports(getattr(rs.option, o, None))]
+            logger.warning(f"no projector/laser power option found. "
+                           f"supported options on this sensor: {supported[:20]}...")
+        else:
+            opt_name, opt = candidates[0]
+            depth_sensor.set_option(opt, laser_power)
+            logger.info(f"{opt_name} set to {laser_power}")
     depth_scale_m = depth_sensor.get_depth_scale()
     logger.info(f"depth scale: {depth_scale_m} m/unit")
 
