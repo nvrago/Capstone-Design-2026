@@ -3,7 +3,7 @@ pipeline.py -- scan-to-cnc orchestrator
 
 stages:
     1. capture: arc sweep, D405 depth frames transformed to plate frame
-    2. register: ICP merge position clouds + plate cut + dome subtract
+    2. register: ICP merge position clouds + plate cut + apparatus mask
     3. process: downsample + outlier removal + normals
     4. mesh: poisson reconstruction (or ball_pivoting / alpha_shape)
     5. toolpath: opencamlib + g-code writer
@@ -31,6 +31,7 @@ import open3d as o3d
 from scanner.capture import RealSenseCapture
 from processing.registration import CloudRegistrator
 from processing.dome_subtract import subtract_dome
+from processing.cad_mask import apply_cad_mask
 from processing.pointcloud import PointCloud
 from processing.mesh import MeshReconstructor
 from processing.toolpath import ToolpathGenerator, CutterDef, CutterType
@@ -305,14 +306,29 @@ class PipelineConfig:
     use_hull_clip: bool = True
     hull_margin_m: float = 0.003  # 3mm outward inflation, preserves edges
 
-    # dome subtraction (secondary, for hemisphere / arc housing).
-    # threshold is loose (50mm) so it only catches obvious hemisphere
+    # dome subtraction (fallback apparatus masking when cad mask disabled).
+    # threshold is loose (8mm) so it only catches obvious hemisphere
     # geometry seen at oblique arc angles. at overhead (90 deg) this
     # removes essentially nothing, which is correct - plate cut
     # already did the work. at 0 or 180 deg, dome subtract removes
     # the arc-housing points the camera sees at grazing angles.
     dome_reference_path: str = "data/reference/dome_cloud.ply"
     dome_threshold_m: float = 0.008
+
+    # cad-based apparatus masking (replaces dome subtract when enabled).
+    # uses the solidworks assembly stl as ground truth for apparatus
+    # geometry. two filters: points near apparatus surfaces are rejected
+    # (plate, arc, frame, control box), and points outside the apparatus
+    # bbox + margin are rejected (walls, ceiling, stray returns).
+    # only points inside the envelope but off all surfaces survive - by
+    # construction, that's the object. default ON; pass --no-cad-mask
+    # to fall back to dome subtraction.
+    use_cad_mask: bool = True
+    cad_stl_path: str = "data/reference/apparatus.STL"
+    cad_scale: float = 0.001
+    cad_origin_offset: tuple = (-0.2773, -0.3300, -0.0945)
+    cad_surface_threshold_m: float = 0.003
+    cad_bounding_margin_m: float = 0.01
 
     # icp registration (clouds already in plate frame, so initial is identity)
     icp_voxel_size: float = 0.005
@@ -419,6 +435,11 @@ class PipelineConfig:
                 "gcode.spindle_speed": "spindle_speed",
                 "icp.voxel_size": "icp_voxel_size",
                 "icp.max_distance": "icp_max_distance",
+                "cad_mask.enabled": "use_cad_mask",
+                "cad_mask.stl_path": "cad_stl_path",
+                "cad_mask.scale": "cad_scale",
+                "cad_mask.surface_threshold_m": "cad_surface_threshold_m",
+                "cad_mask.bounding_margin_m": "cad_bounding_margin_m",
             },
             "machine": {
                 "serial.port": "cnc_port",
@@ -453,6 +474,20 @@ class PipelineConfig:
                         break
                 if val is not None:
                     overrides[field_name] = val
+
+        # cad origin offset is nested in yaml, handle separately
+        proc_path = config_dir / "processing.yaml"
+        if proc_path.exists():
+            with open(proc_path) as f:
+                proc_data = yaml.safe_load(f) or {}
+            cad = proc_data.get("cad_mask", {})
+            offset = cad.get("origin_offset")
+            if offset is not None and all(k in offset for k in ("x", "y", "z")):
+                overrides["cad_origin_offset"] = (
+                    float(offset["x"]),
+                    float(offset["y"]),
+                    float(offset["z"]),
+                )
 
         return cls(**overrides)
 
@@ -599,7 +634,7 @@ class ScanPipeline:
     # stage 2: register + background removal
 
     def stage_2_register(self):
-        """icp merge position clouds, plate surface z-cut, then dome subtract."""
+        """icp merge position clouds, plate surface z-cut, then apparatus mask."""
         logger.info("=== stage 2: register + background removal ===")
         start = time.time()
 
@@ -633,16 +668,29 @@ class ScanPipeline:
             )
         self._save(self.combined_cloud, "after_plate_cut.ply")
 
-        # dome subtraction: secondary, removes hemisphere / arc housing
-        # points visible at oblique arc angles. loose threshold so it
-        # doesn't eat object points near (but above) the plate.
-        self.combined_cloud = subtract_dome(
-            self.combined_cloud,
-            threshold_m=self.config.dome_threshold_m,
-            dome_path=Path(self.config.dome_reference_path),
-        )
-        self._save(self.combined_cloud, "after_dome.ply")
-        logger.info(f"after dome subtract: {len(self.combined_cloud.points)} points")
+        # apparatus masking: either cad-based (default) or dome subtract (fallback).
+        # cad mask uses the full solidworks assembly stl as ground truth - rejects
+        # any point near an apparatus surface or outside the apparatus envelope.
+        # dome subtract is the legacy path using a sampled dome reference ply.
+        if self.config.use_cad_mask:
+            self.combined_cloud = apply_cad_mask(
+                self.combined_cloud,
+                stl_path=Path(self.config.cad_stl_path),
+                scale=self.config.cad_scale,
+                origin_offset=self.config.cad_origin_offset,
+                surface_threshold_m=self.config.cad_surface_threshold_m,
+                bounding_margin_m=self.config.cad_bounding_margin_m,
+            )
+            self._save(self.combined_cloud, "after_cad_mask.ply")
+            logger.info(f"after cad mask: {len(self.combined_cloud.points)} points")
+        else:
+            self.combined_cloud = subtract_dome(
+                self.combined_cloud,
+                threshold_m=self.config.dome_threshold_m,
+                dome_path=Path(self.config.dome_reference_path),
+            )
+            self._save(self.combined_cloud, "after_dome.ply")
+            logger.info(f"after dome subtract: {len(self.combined_cloud.points)} points")
 
         logger.info(f"stage 2 complete in {time.time() - start:.1f}s")
 
@@ -659,7 +707,7 @@ class ScanPipeline:
         if len(self.combined_cloud.points) == 0:
             raise RuntimeError(
             "combined cloud is empty. check stage 2 background removal - "
-            "the plate cut and dome subtract may be too aggressive."
+            "the plate cut and apparatus mask may be too aggressive."
         )
         pcd = PointCloud(np.asarray(self.combined_cloud.points))
         if self.combined_cloud.has_colors():

@@ -38,6 +38,9 @@ override arc positions:
 use .bag recording instead of live camera:
     python scripts/run_pipeline.py --bag data/recordings/test.bag --mock
 
+fall back to dome subtraction (legacy apparatus masking):
+    python scripts/run_pipeline.py --no-cad-mask
+
 dry run (generate gcode but simulate cnc):
     python scripts/run_pipeline.py --dry-run
 
@@ -137,11 +140,26 @@ def parse_args():
                    help="skip heightmap-to-solid extrusion in single-angle "
                         "mode. default: extrude whenever --single-angle is set.")
     p.add_argument("--dome-threshold", type=float, default=None,
-                   help="dome subtraction threshold in meters (default: 0.003)")
+                   help="dome subtraction threshold in meters (default: 0.008). "
+                        "only used when --no-cad-mask is also set.")
     p.add_argument("--plate-z-cut", type=float, default=None,
                    help="plate surface z cut in meters (default: 0.003). "
                         "drops all points at or below this height, cleanly "
                         "removing the plate plane.")
+
+    # cad-based apparatus masking
+    p.add_argument("--no-cad-mask", action="store_true",
+                   help="disable CAD-based apparatus masking and fall back "
+                        "to dome subtraction (default: CAD mask enabled).")
+    p.add_argument("--cad-threshold", type=float, default=None,
+                   help="CAD mask surface rejection threshold in meters "
+                        "(default: 0.003). points within this distance of "
+                        "the apparatus cad surfaces are treated as apparatus "
+                        "and removed.")
+    p.add_argument("--cad-margin", type=float, default=None,
+                   help="CAD mask bounding volume margin in meters "
+                        "(default: 0.01). points farther than this outside "
+                        "the apparatus bbox are treated as background.")
 
     # output
     p.add_argument("--data-dir", type=str, default=None,
@@ -218,6 +236,12 @@ def main():
         config.dome_threshold_m = args.dome_threshold
     if args.plate_z_cut is not None:
         config.plate_surface_z_cut_m = args.plate_z_cut
+    if args.no_cad_mask:
+        config.use_cad_mask = False
+    if args.cad_threshold is not None:
+        config.cad_surface_threshold_m = args.cad_threshold
+    if args.cad_margin is not None:
+        config.cad_bounding_margin_m = args.cad_margin
     if args.data_dir is not None:
         config.data_dir = args.data_dir
 

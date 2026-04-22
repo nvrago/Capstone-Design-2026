@@ -31,8 +31,8 @@ toolpath:
   # Cutter definition
   cutter:
     type: cylindrical    # cylindrical, ball, bull
-    diameter: 6.0        # mm
-    length: 25.0         # mm
+    diameter: 3.0        # mm
+    length: 10.0         # mm
     # For bull cutter
     corner_radius: 0.0   # mm
   
@@ -55,7 +55,19 @@ toolpath:
 gcode:
   feed_rate: 500         # mm/min for cutting
   plunge_rate: 100       # mm/min for Z moves
-  spindle_speed: 10000   # RPM
+  spindle_speed: 1000   # RPM
   coolant: false
   # Post-processor style
   dialect: grbl          # grbl, linuxcnc, or generic
+
+  # CAD-based apparatus masking (replaces dome subtraction when enabled)
+cad_mask:
+  enabled: true
+  stl_path: data/reference/apparatus.STL
+  scale: 0.001  # mm to meters
+  origin_offset:
+    x: -0.2773
+    y: -0.3300
+    z: -0.0945
+  surface_threshold_m: 0.003  # 3mm from apparatus surfaces
+  bounding_margin_m: 0.01     # 1cm slack on apparatus bbox
