@@ -157,3 +157,105 @@ def apply_cad_mask(
     )
 
     return pcd.select_by_index(kept_indices.tolist())
+
+def build_depth_mask_from_cad(
+    depth_array: np.ndarray,
+    intrinsics: "o3d.camera.PinholeCameraIntrinsic",
+    camera_pose: np.ndarray,
+    depth_scale_m: float,
+    stl_path: Path = DEFAULT_STL_PATH,
+    scale: float = DEFAULT_SCALE,
+    origin_offset: tuple = DEFAULT_ORIGIN_OFFSET,
+    match_threshold_m: float = 0.005,
+) -> np.ndarray:
+    """
+    zero out depth pixels that are hitting apparatus surfaces.
+
+    for each pixel, back-projects a ray from the camera through the pixel,
+    raycasts it against the apparatus cad, and compares the hit distance to
+    the captured depth. if they match within match_threshold_m, the pixel is
+    hitting apparatus and gets zeroed. object points (closer than the cad
+    surface or missing the cad entirely) are kept.
+
+    args:
+        depth_array: uint16 depth image, raw sensor units.
+        intrinsics: open3d PinholeCameraIntrinsic matching depth_array shape.
+        camera_pose: 4x4 plate_T_camera transform.
+        depth_scale_m: meters per sensor unit (e.g. 0.0001 for d405).
+        stl_path, scale, origin_offset: same as apply_cad_mask.
+        match_threshold_m: pixels within this distance of the cad surface
+            are treated as apparatus and zeroed.
+
+    returns:
+        masked depth_array (copy, same dtype as input).
+    """
+    scene, _, _ = _load_apparatus(stl_path, scale, origin_offset)
+
+    h, w = depth_array.shape
+    fx = intrinsics.intrinsic_matrix[0, 0]
+    fy = intrinsics.intrinsic_matrix[1, 1]
+    cx = intrinsics.intrinsic_matrix[0, 2]
+    cy = intrinsics.intrinsic_matrix[1, 2]
+
+    # camera origin in plate frame
+    cam_origin = camera_pose[:3, 3].astype(np.float32)
+    # camera rotation: columns are x/y/z axes in plate frame
+    cam_rot = camera_pose[:3, :3].astype(np.float32)
+
+    # build one ray direction per pixel, in camera frame, then rotate to plate
+    us, vs = np.meshgrid(np.arange(w), np.arange(h))
+    dirs_cam = np.stack([
+        (us - cx) / fx,
+        (vs - cy) / fy,
+        np.ones_like(us, dtype=np.float32),
+    ], axis=-1).astype(np.float32)  # (h, w, 3)
+
+    # normalize each direction (raycast expects unit vectors for distance to mean meters)
+    norms = np.linalg.norm(dirs_cam, axis=-1, keepdims=True)
+    dirs_cam = dirs_cam / norms
+
+    # rotate camera-frame directions into plate frame: plate_dir = R @ cam_dir
+    dirs_plate = dirs_cam @ cam_rot.T  # (h, w, 3)
+
+    # build ray tensor: (n_rays, 6) = [ox, oy, oz, dx, dy, dz]
+    n_rays = h * w
+    rays = np.zeros((n_rays, 6), dtype=np.float32)
+    rays[:, 0] = cam_origin[0]
+    rays[:, 1] = cam_origin[1]
+    rays[:, 2] = cam_origin[2]
+    rays[:, 3:6] = dirs_plate.reshape(-1, 3)
+
+    rays_tensor = o3d.core.Tensor(rays, dtype=o3d.core.Dtype.Float32)
+    result = scene.cast_rays(rays_tensor)
+    cad_distances = result["t_hit"].numpy().reshape(h, w)  # meters along ray
+
+    # convert captured depth to meters along the ray (depth is z-distance in
+    # camera frame; our ray direction already accounts for per-pixel angle
+    # because we normalized, so sensor_z -> ray_length = sensor_z * |dir| / dir_z.
+    # since we normalized dirs_cam, dir_z is 1/|original|, so:
+    captured_m_z = depth_array.astype(np.float32) * depth_scale_m
+    # ray length to that z: sensor_z / dir_cam_z_normalized
+    # dir_cam_z_normalized = 1.0 / norm (from normalization above)
+    captured_m_along_ray = captured_m_z * norms.reshape(h, w)
+
+    # apparatus pixel: |captured - cad| < threshold AND both finite
+    valid_captured = depth_array > 0
+    valid_cad = np.isfinite(cad_distances)
+    hits_apparatus = (
+        valid_captured &
+        valid_cad &
+        (np.abs(captured_m_along_ray - cad_distances) < match_threshold_m)
+    )
+
+    masked = depth_array.copy()
+    masked[hits_apparatus] = 0
+
+    n_apparatus = hits_apparatus.sum()
+    n_valid = valid_captured.sum()
+    logger.info(
+        f"depth mask: zeroed {n_apparatus}/{n_valid} apparatus pixels "
+        f"({100.0 * n_apparatus / max(n_valid, 1):.1f}% of valid depth), "
+        f"{n_valid - n_apparatus} object pixels remain"
+    )
+
+    return masked

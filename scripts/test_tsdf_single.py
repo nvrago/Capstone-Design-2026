@@ -3,18 +3,16 @@
 test_tsdf_single.py -- standalone TSDF smoke test.
 
 captures n depth+color frames from the d405 at a single arc position,
+optionally masks apparatus pixels against the cad mesh (option A),
 integrates each frame into a tsdf volume, extracts a mesh via marching
-cubes, and (optionally) also runs the extracted point cloud through the
-existing cad mask + poisson path for comparison.
-
-purpose: confirm open3d's tsdf api works on the pi, the d405 intrinsics
-extract correctly, and multi-frame volumetric fusion produces a cleaner
-result than single-frame averaging + point-cloud poisson.
+cubes, and optionally runs the extracted cloud through cad mask + poisson
+(option B) for comparison.
 
 usage:
     python scripts/test_tsdf_single.py
-    python scripts/test_tsdf_single.py --angle 90 --voxel 0.001
-    python scripts/test_tsdf_single.py --frames 30 --cad-mask
+    python scripts/test_tsdf_single.py --angle 90 --frames 15
+    python scripts/test_tsdf_single.py --cad-mask-depth          # option A
+    python scripts/test_tsdf_single.py --cad-mask                # option B
 """
 
 import sys
@@ -77,11 +75,6 @@ def capture_rgbd_frames(width=640, height=480, fps=30, warmup_frames=30,
 
     no temporal filter here. tsdf does the equivalent work at the voxel
     level; pre-averaging frames would defeat the point of volumetric fusion.
-
-    returns:
-        frames: list of (depth_o3d, color_o3d) tuples
-        intrinsics: open3d PinholeCameraIntrinsic matching frame shape
-        depth_scale_m: float, meters per depth unit
     """
     pipeline = rs.pipeline()
     config = rs.config()
@@ -167,12 +160,7 @@ def capture_rgbd_frames(width=640, height=480, fps=30, warmup_frames=30,
 def build_tsdf_from_frames(frames, intrinsics, depth_scale_m, camera_pose,
                            voxel_size=0.001, sdf_trunc=0.004,
                            depth_trunc=0.5):
-    """integrate n rgbd frames into a fresh tsdf volume at a single pose.
-
-    all frames share the same pose here (single-angle test). noise reduction
-    happens at the voxel level as redundant frames reinforce consistent
-    surfaces and average out per-pixel noise.
-    """
+    """integrate n rgbd frames into a fresh tsdf volume at a single pose."""
     tsdf = o3d.pipelines.integration.ScalableTSDFVolume(
         voxel_length=voxel_size,
         sdf_trunc=sdf_trunc,
@@ -197,9 +185,7 @@ def build_tsdf_from_frames(frames, intrinsics, depth_scale_m, camera_pose,
 
 
 def mesh_via_poisson(pcd, depth=9, density_trim_quantile=0.05):
-    """reconstruct a mesh from a point cloud using poisson. matches the main
-    pipeline's meshing path so the cad-mask comparison is apples-to-apples.
-    """
+    """reconstruct a mesh from a point cloud using poisson."""
     if not pcd.has_normals():
         pcd.estimate_normals(
             search_param=o3d.geometry.KDTreeSearchParamHybrid(
@@ -238,7 +224,11 @@ def main():
     p.add_argument("--arc-center-z", type=float, default=0.0,
                    help="arc center z in meters (default: 0.0)")
     p.add_argument("--cad-mask", action="store_true",
-                   help="also produce a cad-masked + poisson mesh for comparison")
+                   help="option B: mask cloud after tsdf, then poisson re-mesh")
+    p.add_argument("--cad-mask-depth", action="store_true",
+                   help="option A: mask depth frames before tsdf integration")
+    p.add_argument("--mask-threshold", type=float, default=0.005,
+                   help="depth mask match threshold in meters (default: 0.005 = 5mm)")
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args()
 
@@ -259,13 +249,27 @@ def main():
     logger.info(f"  position (m): {pose[:3, 3]}")
     logger.info(f"  forward (cam +Z in plate frame): {pose[:3, 2]}")
 
+    # 2b. optional cad-based depth masking (option A: pre-integration)
+    if args.cad_mask_depth:
+        from processing.cad_mask import build_depth_mask_from_cad
+        logger.info("masking apparatus pixels in depth frames (pre-tsdf)...")
+        masked_frames = []
+        for i, (depth_o3d, color_o3d) in enumerate(frames):
+            depth_array = np.asarray(depth_o3d)
+            masked_depth = build_depth_mask_from_cad(
+                depth_array, intrinsics, pose, depth_scale_m,
+                match_threshold_m=args.mask_threshold,
+            )
+            masked_frames.append((o3d.geometry.Image(masked_depth), color_o3d))
+        frames = masked_frames
+
     # 3. integrate into tsdf
     tsdf = build_tsdf_from_frames(
         frames, intrinsics, depth_scale_m, pose,
         args.voxel, args.sdf_trunc, args.depth_trunc,
     )
 
-    # 4. direct tsdf outputs (mesh + cloud, no masking)
+    # 4. direct tsdf outputs (mesh + cloud)
     logger.info("extracting direct tsdf mesh via marching cubes...")
     mesh_direct = tsdf.extract_triangle_mesh()
     mesh_direct.compute_vertex_normals()
@@ -279,10 +283,10 @@ def main():
     o3d.io.write_triangle_mesh(str(output / "tsdf_mesh.stl"), mesh_direct)
     o3d.io.write_point_cloud(str(output / "tsdf_cloud.ply"), pcd_direct)
 
-    # 5. optional: cad-masked + poisson comparison path
+    # 5. optional: option B cad-mask + poisson comparison path
     if args.cad_mask:
         from processing.cad_mask import apply_cad_mask
-        logger.info("applying cad mask to tsdf cloud...")
+        logger.info("applying cad mask to tsdf cloud (post-integration)...")
         pcd_masked = apply_cad_mask(pcd_direct)
         logger.info(f"  masked cloud: {len(pcd_masked.points)} points")
 
@@ -302,15 +306,19 @@ def main():
         o3d.io.write_image(str(output / "depth.png"), frames[-1][0])
         o3d.io.write_image(str(output / "color.png"), frames[-1][1])
 
+    # 7. output summary
     logger.info(f"outputs in {output}/")
-    logger.info("  tsdf_mesh.{ply,stl}: direct marching-cubes mesh (no mask)")
-    logger.info("  tsdf_cloud.ply: point cloud from tsdf (no mask)")
+    if args.cad_mask_depth:
+        logger.info("  tsdf_mesh.{ply,stl}: direct marching-cubes mesh (cad-depth-masked)")
+    else:
+        logger.info("  tsdf_mesh.{ply,stl}: direct marching-cubes mesh (no mask)")
+    logger.info("  tsdf_cloud.ply: point cloud from tsdf")
     if args.cad_mask:
-        logger.info("  tsdf_cloud_masked.ply: after cad mask")
+        logger.info("  tsdf_cloud_masked.ply: after post-hoc cad mask")
         logger.info("  tsdf_mesh_masked.{ply,stl}: cad-masked + poisson mesh")
     logger.info("  depth.png / color.png: last input frame")
 
-    # 7. bounds sanity
+    # 8. bounds sanity
     if len(mesh_direct.vertices) > 0:
         verts = np.asarray(mesh_direct.vertices)
         logger.info("direct mesh bounds (m, plate frame):")
