@@ -836,19 +836,19 @@ class ScanPipeline:
         logger.info(f"stage 4 complete: {mesh.triangle_count} triangles "
                     f"in {time.time() - start:.1f}s")
 
-def stage_5_toolpath(self):
-    """opencamlib surface dropcutter + g-code."""
-    logger.info("=== stage 5: toolpath ===")
-    start = time.time()
+    def stage_5_toolpath(self):
+        """opencamlib surface dropcutter + g-code."""
+        logger.info("=== stage 5: toolpath ===")
+        start = time.time()
 
-    if self.mesh is None:
-        raise RuntimeError("no mesh, run stage 4 first")
+        if self.mesh is None:
+            raise RuntimeError("no mesh, run stage 4 first")
 
-    cutter = CutterDef(
-        type=CutterType("cylindrical"),
-        diameter=self.config.cutter_diameter,
-        length=self.config.cutter_length,
-    )
+        cutter = CutterDef(
+            type=CutterType("cylindrical"),
+            diameter=self.config.cutter_diameter,
+            length=self.config.cutter_length,
+        )
     generator = ToolpathGenerator(cutter=cutter)
 
     # load_mesh scales m -> mm and shifts min corner to (0,0), top to Z=0.
