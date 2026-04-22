@@ -174,13 +174,13 @@ def capture_one_rgbd(width=640, height=480, fps=30, warmup_frames=30,
             cx=intrinsics.intrinsic_matrix[0, 2] * scale_x,
             cy=intrinsics.intrinsic_matrix[1, 2] * scale_y,
         )
-        # color resize: simple cv-style nearest if shapes don't match
-        from PIL import Image
-        color_pil = Image.fromarray(color_array).resize(
-            (depth_array.shape[1], depth_array.shape[0]),
-            Image.NEAREST,
-        )
-        color_array = np.array(color_pil)
+        # color resize: simple nearest-neighbor downsample using numpy indexing.
+        # decimation is integer (typically 2x), so this is exact.
+        h_target, w_target = depth_array.shape[:2]
+        h_src, w_src = color_array.shape[:2]
+        ys = (np.arange(h_target) * h_src / h_target).astype(np.int32)
+        xs = (np.arange(w_target) * w_src / w_target).astype(np.int32)
+        color_array = color_array[ys[:, None], xs[None, :]]
 
     depth_o3d = o3d.geometry.Image(depth_array)
     color_o3d = o3d.geometry.Image(color_array)
