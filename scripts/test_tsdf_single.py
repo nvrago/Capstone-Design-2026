@@ -91,7 +91,7 @@ def capture_rgbd_frames(width=640, height=480, fps=30, warmup_frames=30,
     profile = pipeline.start(config)
 
     depth_sensor = profile.get_device().first_depth_sensor()
-    depth_sensor.set_option(rs.option.visual_preset, 3)  # high accuracy
+    depth_sensor.set_option(rs.option.visual_preset, 4)  # high density (tsdf averages out noise at voxel level)
     depth_scale_m = depth_sensor.get_depth_scale()
     logger.info(f"depth scale: {depth_scale_m} m/unit")
 
