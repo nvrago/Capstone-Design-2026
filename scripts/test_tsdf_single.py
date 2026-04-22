@@ -96,7 +96,7 @@ def arc_pose_matrix(angle_deg, arc_radius_m=0.255, arc_center_z_m=0.0):
 
 
 def capture_one_rgbd(width=640, height=480, fps=30, warmup_frames=30,
-                      averaging_frames=15):
+                      averaging_frames=15, laser_power=None):
     """capture one depth+color frame from the d405 with temporal averaging.
 
     returns:
@@ -115,6 +115,9 @@ def capture_one_rgbd(width=640, height=480, fps=30, warmup_frames=30,
     # set high accuracy preset
     depth_sensor = profile.get_device().first_depth_sensor()
     depth_sensor.set_option(rs.option.visual_preset, 3)  # high accuracy
+    if laser_power is not None:
+        depth_sensor.set_option(rs.option.laser_power, laser_power)
+        logger.info(f"laser power set to {laser_power} mW")
     depth_scale_m = depth_sensor.get_depth_scale()
     logger.info(f"depth scale: {depth_scale_m} m/unit")
 
@@ -241,6 +244,9 @@ def main():
                    help="arc radius in meters (default: 0.255)")
     p.add_argument("--arc-center-z", type=float, default=0.0,
                    help="arc center z in meters (default: 0.0)")
+    p.add_argument("--laser-power", type=float, default=None,
+                   help="d405 IR laser power in mW (default: sensor default 150). "
+                        "try lower values (30-90) for shiny/reflective surfaces.")
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args()
 
@@ -253,7 +259,7 @@ def main():
     output.mkdir(parents=True, exist_ok=True)
 
     # 1. capture one rgbd frame
-    depth_o3d, color_o3d, intrinsics, depth_scale_m = capture_one_rgbd()
+    depth_o3d, color_o3d, intrinsics, depth_scale_m = capture_one_rgbd(laser_power=args.laser_power)
 
     # 2. compute camera pose for the given arc angle
     pose = arc_pose_matrix(args.angle, args.arc_radius, args.arc_center_z)
