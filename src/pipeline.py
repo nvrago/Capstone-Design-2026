@@ -324,13 +324,21 @@ class PipelineConfig:
     tsdf_voxel_size_m: float = 0.001
     tsdf_sdf_trunc_m: float = 0.004
     tsdf_depth_trunc_m: float = 0.5
-    tsdf_cad_mask_depth: bool = False
+    tsdf_cad_mask_depth: bool = True
     tsdf_mask_threshold_m: float = 0.010
     tsdf_cad_mask_post: bool = False
     tsdf_keep_largest_cluster: bool = True
     tsdf_cluster_eps_m: float = 0.005
     tsdf_cluster_min_points: int = 50
     tsdf_visual_preset: int = 4
+
+    # multi-angle voting: reject vertices seen by fewer than min_votes angles.
+    # kills V-shape artifacts from slight pose miscalibration since each
+    # artifact is only "seen" by the one angle that produced it. has no
+    # effect on single-angle runs (vote threshold auto-relaxes).
+    tsdf_use_angle_voting: bool = True
+    tsdf_min_angle_votes: int = 2
+    tsdf_voting_distance_m: float = 0.002
 
     # capture-time color filtering
     filter_black_threshold: int = None
@@ -735,7 +743,7 @@ class ScanPipeline:
             self.mesh: tsdf-extracted triangle mesh (plate frame), may be
                        replaced by poisson re-mesh if cad_mask_post is set.
         """
-        from processing.tsdf import TSDFIntegrator
+        from processing.tsdf import MultiAngleTSDFIntegrator
         from processing.cad_mask import (
             build_depth_mask_from_cad,
             apply_cad_mask,
@@ -750,7 +758,7 @@ class ScanPipeline:
                 "stage 1 must run with mesh_method='tsdf' to collect frames."
             )
 
-        integrator = TSDFIntegrator(
+        integrator = MultiAngleTSDFIntegrator(
             voxel_size_m=self.config.tsdf_voxel_size_m,
             sdf_trunc_m=self.config.tsdf_sdf_trunc_m,
             depth_trunc_m=self.config.tsdf_depth_trunc_m,
@@ -762,7 +770,7 @@ class ScanPipeline:
             logger.info(
                 f"position {angle:+.1f} deg: integrating {len(frames)} frames"
             )
-
+            integrator.set_angle(angle)
             for depth_arr, color_arr in frames:
                 if self.config.tsdf_cad_mask_depth:
                     depth_arr = build_depth_mask_from_cad(
@@ -777,22 +785,77 @@ class ScanPipeline:
                 )
                 total_frames += 1
 
-        logger.info(f"integrated {total_frames} frames from "
-                    f"{len(self.position_frames)} positions")
+        logger.info(
+            f"integrated {total_frames} frames from "
+            f"{integrator.angle_count} angles"
+        )
 
-        # extract cloud and mesh from the volume
+        # extract cloud and mesh from the fused volume
         cloud = integrator.extract_cloud()
         mesh = integrator.extract_mesh()
 
         self._save(cloud, "tsdf_cloud.ply")
         self._save(mesh, "tsdf_mesh.ply")
 
+        # multi-angle voting: reject mesh vertices that only one angle
+        # saw. if we're below the effective vote threshold (single-angle
+        # runs, or config disabled), skip this pass.
+        effective_min_votes = min(
+            self.config.tsdf_min_angle_votes,
+            integrator.angle_count,
+        )
+        if (
+            self.config.tsdf_use_angle_voting
+            and integrator.angle_count >= 2
+            and effective_min_votes >= 2
+        ):
+            logger.info(
+                f"multi-angle voting: min_votes={effective_min_votes}, "
+                f"distance={self.config.tsdf_voting_distance_m*1000:.1f}mm"
+            )
+            verts = np.asarray(mesh.vertices)
+            votes = integrator.vertex_angle_votes(
+                verts,
+                distance_m=self.config.tsdf_voting_distance_m,
+            )
+            keep_vert = votes >= effective_min_votes
+            n_keep = int(keep_vert.sum())
+            logger.info(
+                f"vote filter: keep {n_keep}/{len(verts)} vertices "
+                f"({100.0*n_keep/max(len(verts),1):.1f}%) with votes>={effective_min_votes}"
+            )
+            # drop triangles with any unconfirmed vertex
+            tris = np.asarray(mesh.triangles)
+            tri_keep = keep_vert[tris].all(axis=1)
+            n_tri_before = len(tris)
+            mesh.remove_triangles_by_mask((~tri_keep).tolist())
+            mesh.remove_unreferenced_vertices()
+            logger.info(
+                f"vote filter: {n_tri_before} -> {len(mesh.triangles)} triangles"
+            )
+            self._save(mesh, "tsdf_mesh_voted.ply")
+
+            # apply the same voting to the cloud for downstream consistency
+            cloud_verts = np.asarray(cloud.points)
+            cloud_votes = integrator.vertex_angle_votes(
+                cloud_verts,
+                distance_m=self.config.tsdf_voting_distance_m,
+            )
+            cloud_keep = cloud_votes >= effective_min_votes
+            n_cloud_keep = int(cloud_keep.sum())
+            logger.info(
+                f"vote filter (cloud): keep {n_cloud_keep}/{len(cloud_verts)} "
+                f"({100.0*n_cloud_keep/max(len(cloud_verts),1):.1f}%)"
+            )
+            cloud = cloud.select_by_index(np.where(cloud_keep)[0].tolist())
+            self._save(cloud, "tsdf_cloud_voted.ply")
+        else:
+            logger.info(
+                f"multi-angle voting: skipped "
+                f"(angles={integrator.angle_count}, enabled={self.config.tsdf_use_angle_voting})"
+            )
+
         # working-volume filter: plate-frame box clip on both cloud and mesh.
-        # this is the outermost envelope filter, replacing the earlier bandaid
-        # approach of mesh-native cluster filtering. anything outside the
-        # plate's known object envelope (cables, table edge, room geometry)
-        # is dropped regardless of connectivity. cad mask handles apparatus
-        # surfaces it knows about; this catches everything else.
         logger.info("applying plate-frame clip to tsdf output...")
         n_cloud_before = len(cloud.points)
         cloud = _plate_frame_clip(
@@ -824,9 +887,6 @@ class ScanPipeline:
         self._save(cloud, "tsdf_cloud_clipped.ply")
         self._save(mesh, "tsdf_mesh_clipped.ply")
 
-        # optional post-hoc cad mask + cluster filter on the clipped cloud.
-        # runs when cad_mask_post OR cluster filtering is requested -- the
-        # cad mask function handles clustering too.
         needs_post = (
             self.config.tsdf_cad_mask_post
             or self.config.tsdf_keep_largest_cluster
@@ -846,8 +906,6 @@ class ScanPipeline:
                     cluster_min_points=self.config.tsdf_cluster_min_points,
                 )
             else:
-                # cluster-only, no additional cad mask (surface_threshold=0,
-                # bounding_margin very large so nothing gets rejected by them)
                 cloud = apply_cad_mask(
                     cloud,
                     stl_path=Path(self.config.cad_stl_path),
@@ -861,8 +919,6 @@ class ScanPipeline:
                 )
             self._save(cloud, "tsdf_cloud_filtered.ply")
 
-            # if cad_mask_post was enabled, re-mesh via poisson on the masked
-            # cloud (option B path); the tsdf direct mesh gets replaced.
             if self.config.tsdf_cad_mask_post:
                 logger.info("poisson re-mesh on masked cloud...")
                 pc = PointCloud(np.asarray(cloud.points))
