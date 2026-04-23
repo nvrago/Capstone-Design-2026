@@ -101,6 +101,9 @@ def apply_cad_mask(
     origin_offset: tuple = DEFAULT_ORIGIN_OFFSET,
     surface_threshold_m: float = 0.003,
     bounding_margin_m: float = 0.01,
+    keep_largest_cluster: bool = False,
+    cluster_eps_m: float = 0.005,
+    cluster_min_points: int = 50,
 ) -> o3d.geometry.PointCloud:
     """
     mask out apparatus and background points using the cad assembly.
@@ -156,7 +159,26 @@ def apply_cad_mask(
         f"{n_kept} object points remain"
     )
 
-    return pcd.select_by_index(kept_indices.tolist())
+    out = pcd.select_by_index(kept_indices.tolist())
+
+    if keep_largest_cluster and len(out.points) > cluster_min_points:
+        labels = np.array(out.cluster_dbscan(
+            eps=cluster_eps_m, min_points=cluster_min_points, print_progress=False
+        ))
+        n_clusters = int(labels.max()) + 1 if len(labels) else 0
+        if n_clusters > 0:
+            sizes = [(labels == l).sum() for l in range(n_clusters)]
+            biggest = int(np.argmax(sizes))
+            keep_idx = np.where(labels == biggest)[0]
+            n_before = len(out.points)
+            out = out.select_by_index(keep_idx.tolist())
+            logger.info(
+                f"cluster filter: kept largest of {n_clusters} clusters, "
+                f"{n_before} -> {len(out.points)} points "
+                f"(eps={cluster_eps_m*1000:.0f}mm, min_pts={cluster_min_points})"
+            )
+
+    return out
 
 def build_depth_mask_from_cad(
     depth_array: np.ndarray,

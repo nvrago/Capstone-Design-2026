@@ -229,6 +229,10 @@ def main():
                    help="option A: mask depth frames before tsdf integration")
     p.add_argument("--mask-threshold", type=float, default=0.005,
                    help="depth mask match threshold in meters (default: 0.005 = 5mm)")
+    p.add_argument("--keep-largest-cluster", action="store_true",
+                   help="after cad mask, keep only the largest connected cluster")
+    p.add_argument("--cluster-eps", type=float, default=0.005,
+                   help="dbscan eps in meters for cluster filter (default: 0.005)")
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args()
 
@@ -287,7 +291,11 @@ def main():
     if args.cad_mask:
         from processing.cad_mask import apply_cad_mask
         logger.info("applying cad mask to tsdf cloud (post-integration)...")
-        pcd_masked = apply_cad_mask(pcd_direct)
+        pcd_masked = apply_cad_mask(
+            pcd_direct,
+            keep_largest_cluster=args.keep_largest_cluster,
+            cluster_eps_m=args.cluster_eps,
+        )
         logger.info(f"  masked cloud: {len(pcd_masked.points)} points")
 
         if len(pcd_masked.points) > 100:
