@@ -1,20 +1,56 @@
-# Processing Configuration
+# processing configuration
 
-# Point cloud processing
+# ------------------------------------------------------------
+# tsdf integration (stage 3 core)
+# ------------------------------------------------------------
+# voxel_size_m   1mm matches d405 close-range accuracy
+# sdf_trunc_m    ~4 voxels of carving distance
+# depth_trunc_m  0.5m matches d405 ideal range
+# depth_scale    divisor applied to raw depth to get meters.
+#                d405 default is 0.0001m/unit -> divisor 10000.
+#                scanner queries the actual value at runtime and
+#                overrides this unless the query fails.
+tsdf:
+  voxel_size_m: 0.001
+  sdf_trunc_m: 0.004
+  depth_trunc_m: 0.5
+  depth_scale: 10000.0
+
+# ------------------------------------------------------------
+# plate-frame filtering (stage 3 post-tsdf)
+# ------------------------------------------------------------
+# xy_extent_m           +/- from plate center in x and y
+# z_min_m               drop plate surface + noise (positive = above plate)
+# z_max_m               maximum object height
+# cluster_eps_m         dbscan neighborhood radius (5mm)
+# cluster_min_points    minimum points in a valid cluster
+clip:
+  xy_extent_m: 0.100
+  z_min_m: 0.002
+  z_max_m: 0.100
+  cluster_eps_m: 0.005
+  cluster_min_points: 50
+
+# ------------------------------------------------------------
+# legacy point cloud processing (pre-tsdf pipeline)
+# ------------------------------------------------------------
+# these values are still read by PipelineConfig.from_yaml for
+# backwards compat, but the tsdf pipeline ignores them. safe to
+# leave or delete; kept for reference.
 pointcloud:
-  # Statistical outlier removal
   outlier_removal:
     nb_neighbors: 20
     std_ratio: 2.0
-  # Voxel downsampling (set to null to disable)
   voxel_size: 0.5  # mm
-  # Normal estimation
   normal_radius: 2.0  # mm
 
-# Mesh reconstruction
+# ------------------------------------------------------------
+# legacy mesh reconstruction (pre-tsdf pipeline)
+# ------------------------------------------------------------
+# tsdf uses marching cubes from the fused volume, so these are
+# no-ops. kept for yaml backwards compat.
 mesh:
-  # Method: poisson, ball_pivoting, or alpha_shape
-  method: poisson
+  method: tsdf
   poisson:
     depth: 9
     width: 0
@@ -22,40 +58,36 @@ mesh:
     linear_fit: false
   ball_pivoting:
     radii: [0.5, 1.0, 2.0]  # mm
-  # Post-processing
   smooth_iterations: 1
-  simplify_target: null  # target triangle count, null to disable
+  simplify_target: null
 
-# Toolpath generation (OpenCAMLib)
+# ------------------------------------------------------------
+# toolpath generation (OpenCAMLib) — stage 5
+# ------------------------------------------------------------
 toolpath:
-  # Cutter definition
   cutter:
-    type: cylindrical    # cylindrical, ball, bull
-    diameter: 3.0        # mm
-    length: 10.0         # mm
-    # For bull cutter
-    corner_radius: 0.0   # mm
-  
-  # Operation type
-  operation: surface     # surface, waterline, or both
-  
-  # Surface (drop cutter) settings
+    type: cylindrical
+    diameter: 3.0
+    length: 10.0
+    corner_radius: 0.0
+
+  operation: surface
+
   surface:
-    stepover: 2.0        # mm between passes
-    direction: x         # x, y, or both (crosshatch)
-    
-  # Waterline (contour) settings  
+    stepover: 2.0
+    direction: x
+
   waterline:
-    z_step: 1.0          # mm between Z levels
-    
-  # Safety
-  clearance_height: 10.0  # mm above highest point
-  
-# G-code output
+    z_step: 1.0
+
+  clearance_height: 10.0
+
+# ------------------------------------------------------------
+# g-code output — stage 5
+# ------------------------------------------------------------
 gcode:
-  feed_rate: 500         # mm/min for cutting
-  plunge_rate: 100       # mm/min for Z moves
-  spindle_speed: 1000   # RPM
+  feed_rate: 500
+  plunge_rate: 100
+  spindle_speed: 1000
   coolant: false
-  # Post-processor style
-  dialect: grbl          # grbl, linuxcnc, or generic
+  dialect: grbl
