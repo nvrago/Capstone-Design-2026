@@ -324,7 +324,7 @@ class PipelineConfig:
     tsdf_voxel_size_m: float = 0.001
     tsdf_sdf_trunc_m: float = 0.004
     tsdf_depth_trunc_m: float = 0.5
-    tsdf_cad_mask_depth: bool = True
+    tsdf_cad_mask_depth: bool = False
     tsdf_mask_threshold_m: float = 0.010
     tsdf_cad_mask_post: bool = False
     tsdf_keep_largest_cluster: bool = True
