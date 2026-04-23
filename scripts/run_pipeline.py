@@ -125,7 +125,7 @@ def parse_args():
     p.add_argument("--poisson-depth", type=int, default=None,
                    help="poisson reconstruction depth")
     p.add_argument("--mesh-method", type=str, default=None,
-                   choices=["poisson", "alpha_shape", "ball_pivoting"],
+                   choices=["poisson", "alpha_shape", "ball_pivoting", "tsdf"],
                    help="mesh reconstruction method. if omitted: ball_pivoting "
                         "for --single-angle runs, poisson for full arc sweeps. "
                         "explicit value always wins. poisson builds closed "
