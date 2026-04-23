@@ -339,10 +339,8 @@ class RealSenseCapture:
                 logger.warning(f"frame {i}: missing depth or color, skipping")
                 continue
 
-            # spatial + decimation filters only; NO temporal (tsdf handles
-            # that at the voxel level across frames).
-            depth = self.decimation.process(depth)
-            depth = self.spatial.process(depth)
+            # no rs filters in tsdf path: tsdf handles noise reduction
+            # at the voxel level across frames.
 
             depth_array = np.asanyarray(depth.get_data())
             color_array = np.asanyarray(color.get_data())[:, :, ::-1].copy()
