@@ -161,7 +161,8 @@ class RealSenseCapture:
     def _apply_filters(self, depth_frame, skip_temporal: bool = False):
         """run depth frame through the filter chain."""
         frame = depth_frame
-        frame = self.threshold.process(frame)   # clip invalid / out-of-range first
+        if not skip_temporal:  # tsdf depth_trunc handles this instead
+            frame = self.threshold.process(frame)   # clip invalid / out-of-range first
         frame = self.decimation.process(frame)
         frame = self.spatial.process(frame)
         if not skip_temporal:
