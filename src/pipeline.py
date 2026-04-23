@@ -519,6 +519,33 @@ class ScanPipeline:
         mesh = Mesh()
         mesh.mesh = self._raw_mesh
         mesh.remove_degenerate()
+
+        # extra degeneracy sweep: open3d's remove_duplicated_vertices only
+        # catches bitwise-identical positions. marching cubes can emit
+        # vertices that differ in the last float bits but round to the same
+        # position when opencamlib computes edge lengths. drop any triangle
+        # with a sub-epsilon edge before handing to ocl (which asserts
+        # hard and aborts the process on zero-length edges).
+        import numpy as _np
+        verts = _np.asarray(mesh.mesh.vertices)
+        tris = _np.asarray(mesh.mesh.triangles)
+        if len(tris) > 0:
+            v0 = verts[tris[:, 0]]
+            v1 = verts[tris[:, 1]]
+            v2 = verts[tris[:, 2]]
+            eps = 1e-9
+            good = (
+                (_np.linalg.norm(v1 - v0, axis=1) > eps) &
+                (_np.linalg.norm(v2 - v1, axis=1) > eps) &
+                (_np.linalg.norm(v0 - v2, axis=1) > eps)
+            )
+            n_bad = int((~good).sum())
+            if n_bad > 0:
+                logger.info(f"stage_4: dropping {n_bad} near-zero-edge tris")
+                import open3d as _o3d
+                mesh.mesh.triangles = _o3d.utility.Vector3iVector(tris[good])
+                mesh.mesh.remove_unreferenced_vertices()
+
         mesh.compute_normals()
 
         self._save(mesh, "mesh.stl")
