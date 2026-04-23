@@ -516,7 +516,8 @@ class ScanPipeline:
         # Mesh wrapper provides .remove_degenerate / .compute_normals /
         # .get_bounds / .triangle_count / .mesh — all methods stage 5
         # and the toolpath generator use.
-        mesh = Mesh(self._raw_mesh)
+        mesh = Mesh()
+        mesh.mesh = self._raw_mesh
         mesh.remove_degenerate()
         mesh.compute_normals()
 
