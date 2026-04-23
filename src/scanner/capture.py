@@ -59,10 +59,12 @@ def camera_to_plate(
     # at theta=0: (-1,0,0). at theta=90: (0,0,-1). at theta=180: (1,0,0).
     forward = np.array([-c, 0.0, -s], dtype=np.float64)
 
-    # camera down (+Y) in plate coords. rotates with the arc so the
-    # image stays consistently oriented as the camera sweeps overhead.
-    # at theta=0: (0,0,-1). at theta=90: (1,0,0). at theta=180: (0,0,1).
-    down = np.array([s, 0.0, -c], dtype=np.float64)
+    # camera down (+Y) in plate coords.
+    # camera is mounted such that the top of the body points plate -Y,
+    # so "down in image" (camera +Y) = plate +Y at every arc angle.
+    # this axis is perpendicular to the arc sweep plane (XZ), so it
+    # does not rotate with the carriage.
+    down = np.array([0.0, 1.0, 0.0], dtype=np.float64)
 
     # camera right (+X) = down x forward, right-handed.
     right = np.cross(down, forward)
