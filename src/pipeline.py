@@ -338,7 +338,7 @@ class PipelineConfig:
     # effect on single-angle runs (vote threshold auto-relaxes).
     tsdf_use_angle_voting: bool = True
     tsdf_min_angle_votes: int = 2
-    tsdf_voting_distance_m: float = 0.002
+    tsdf_voting_distance_m: float = 0.015
 
     # capture-time color filtering
     filter_black_threshold: int = None
