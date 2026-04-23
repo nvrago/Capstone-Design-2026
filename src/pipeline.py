@@ -890,6 +890,30 @@ class ScanPipeline:
                 mesh = mesh_result.mesh
                 self._save(mesh, "tsdf_mesh_poisson.ply")
 
+        # mesh-native cluster filter: keep only the largest connected component
+        # of the tsdf mesh, matching what cluster-filtering the cloud did for
+        # tsdf_cloud_filtered.ply. this prevents the toolpath stage from seeing
+        # apparatus-fragment triangles that the cad mask missed.
+        if self.config.tsdf_keep_largest_cluster and len(mesh.triangles) > 0:
+            triangle_clusters, cluster_n_triangles, _ = (
+                mesh.cluster_connected_triangles()
+            )
+            triangle_clusters = np.asarray(triangle_clusters)
+            cluster_n_triangles = np.asarray(cluster_n_triangles)
+            if len(cluster_n_triangles) > 0:
+                biggest = int(np.argmax(cluster_n_triangles))
+                n_tri_before = len(mesh.triangles)
+                keep_mask = triangle_clusters == biggest
+                remove_mask = ~keep_mask
+                mesh.remove_triangles_by_mask(remove_mask)
+                mesh.remove_unreferenced_vertices()
+                logger.info(
+                    f"mesh cluster filter: kept largest of "
+                    f"{len(cluster_n_triangles)} components, "
+                    f"{n_tri_before} -> {len(mesh.triangles)} triangles"
+                )
+            self._save(mesh, "tsdf_mesh_filtered.ply")
+
         self.combined_cloud = cloud
         self.processed_cloud = cloud
         self.mesh = mesh
