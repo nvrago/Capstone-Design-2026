@@ -69,17 +69,29 @@ def keep_largest_cluster(pcd: o3d.geometry.PointCloud,
         logger.warning("keep_largest_cluster: no clusters found, returning input")
         return pcd
 
-    # count points per non-noise label
-    valid = labels[labels >= 0]
-    counts = np.bincount(valid)
-    largest = int(np.argmax(counts))
-    kept = np.where(labels == largest)[0]
-
+    # pick cluster by highest max-z instead of most points. the object
+    # is taller than the plate by definition, so the tallest cluster is
+    # always the object. picking by count fails when the plate remnant
+    # (after box clip) has more points than the object's top surface.
+    pts = np.asarray(pcd.points)
     n_clusters = int(labels.max()) + 1
+    max_z_per_cluster = {}
+    for lbl in range(n_clusters):
+        cluster_pts = pts[labels == lbl]
+        if len(cluster_pts) > 0:
+            max_z_per_cluster[lbl] = cluster_pts[:, 2].max()
+
+    if not max_z_per_cluster:
+        logger.warning("keep_largest_cluster: no non-empty clusters")
+        return pcd
+
+    tallest = max(max_z_per_cluster, key=max_z_per_cluster.get)
+    kept = np.where(labels == tallest)[0]
     out = pcd.select_by_index(kept)
     logger.info("keep_largest_cluster: %d clusters found, kept label=%d "
-                "(%d/%d points)",
-                n_clusters, largest, len(kept), len(pcd.points))
+                "(max_z=%.1fmm, %d/%d points)",
+                n_clusters, tallest, max_z_per_cluster[tallest]*1000,
+                len(kept), len(pcd.points))
     return out
 
 
