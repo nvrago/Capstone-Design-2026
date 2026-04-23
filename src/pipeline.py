@@ -5,9 +5,11 @@ stages:
     1. capture: arc sweep, D405 depth frames transformed to plate frame
     2. register: ICP merge position clouds + plate cut + apparatus mask
     3. process: downsample + outlier removal + normals
-    4. mesh: poisson reconstruction (or ball_pivoting / alpha_shape)
+    4. mesh: poisson reconstruction (or ball_pivoting / alpha_shape / tsdf)
     5. toolpath: opencamlib + g-code writer
     6. execute: stream g-code to grbl (optional)
+
+tsdf path replaces stages 2+3 with volumetric fusion (stage_tsdf_integrate).
 
 each run is saved to data/runs/<timestamp>/ with intermediate plys.
 previous runs are never overwritten.
@@ -48,7 +50,7 @@ def _plate_frame_clip(
     z_min_m: float,
     z_max_m: float,
 ) -> o3d.geometry.PointCloud:
-    """box clip in plate frame. outermost envelope filter in stage 1."""
+    """box clip in plate frame. outermost envelope filter."""
     pts = np.asarray(pcd.points)
     if len(pts) == 0:
         return pcd
@@ -109,14 +111,11 @@ def _plate_surface_cut_adaptive(
     if len(pts) == 0:
         return pcd
 
-    # take the bottom fraction by z; these are the plate
     n = len(pts)
     n_bottom = max(int(n * bottom_fraction), 50)
     bottom_idx = np.argpartition(pts[:, 2], n_bottom)[:n_bottom]
     bottom_pts = pts[bottom_idx]
 
-    # least-squares plane fit: z = a*x + b*y + c
-    # gives plane normal [-a, -b, 1] / sqrt(a^2 + b^2 + 1), offset c
     A = np.column_stack([bottom_pts[:, 0], bottom_pts[:, 1], np.ones(n_bottom)])
     coeffs, *_ = np.linalg.lstsq(A, bottom_pts[:, 2], rcond=None)
     a, b, c = coeffs
@@ -124,7 +123,6 @@ def _plate_surface_cut_adaptive(
     normal /= np.linalg.norm(normal)
     d = -c / np.sqrt(a * a + b * b + 1.0)
 
-    # signed distance from each point to the plane, positive = above
     dist = pts @ normal + d
 
     mask = dist > buffer_m
@@ -157,7 +155,6 @@ def _object_component_vertices(mesh) -> np.ndarray:
     verts = np.asarray(mesh.mesh.vertices)
     tris = np.asarray(mesh.mesh.triangles)
 
-    # compute max z per component
     max_z_per_component = np.full(len(counts), -np.inf)
     for comp_idx in range(len(counts)):
         tri_mask = labels == comp_idx
@@ -180,6 +177,7 @@ def _object_component_vertices(mesh) -> np.ndarray:
     comp_vert_idx = np.unique(comp_tris.ravel())
     return verts[comp_vert_idx]
 
+
 def _xy_hull_with_margin(points: np.ndarray, margin_m: float) -> np.ndarray:
     """
     compute convex hull of the points' XY projection, then inflate
@@ -200,7 +198,6 @@ def _xy_hull_with_margin(points: np.ndarray, margin_m: float) -> np.ndarray:
     try:
         hull = ConvexHull(xy)
     except Exception:
-        # scipy complains on collinear or duplicate points; fall back to bbox
         mn = xy.min(axis=0) - margin_m
         mx = xy.max(axis=0) + margin_m
         return np.array([
@@ -210,7 +207,6 @@ def _xy_hull_with_margin(points: np.ndarray, margin_m: float) -> np.ndarray:
             [mn[0], mx[1]],
         ])
     hull_pts = xy[hull.vertices]
-    # inflate outward: push each hull vertex away from the centroid
     centroid = hull_pts.mean(axis=0)
     directions = hull_pts - centroid
     norms = np.linalg.norm(directions, axis=1, keepdims=True)
@@ -266,8 +262,6 @@ class PipelineConfig:
     steps_per_degree: float = 333.33
 
     # arc geometry (plate frame, from onshape dome)
-    # origin at plate-top center, +Z up, arc sweeps XZ plane.
-    # verified calibration: plate frame centroid = -0.002m at 90 deg.
     arc_radius_m: float = 0.255
     arc_center_z_m: float = 0.000
 
@@ -285,44 +279,22 @@ class PipelineConfig:
     plate_z_min_m: float = 0.002
     plate_z_max_m: float = 0.150
 
-    # plate-surface z cut (primary background removal).
-    # captured plate lands at z ~= 0 with ~3mm noise, so cutting at 3mm
-    # drops it cleanly while keeping object points above.
+    # plate-surface z cut (primary background removal for non-tsdf path).
     plate_surface_z_cut_m: float = 0.003
 
     # adaptive plate cut (replaces the static z_cut above when enabled).
-    # fits a plane to the lowest 20% of points and cuts within this
-    # distance above the plane. tighter than the static cut because
-    # it adapts to actual plate height/tilt rather than assuming z~=0.
-    # 2.5mm preserves sub-5mm object features while hugging the plate.
     plate_surface_buffer_m: float = 0.0025
     use_adaptive_plate_cut: bool = False
 
-    # object-footprint hull clip (stage 4 cleanup).
-    # after the first mesh pass, finds the largest connected component,
-    # takes its XY convex hull (with small margin), clips the processed
-    # cloud to that footprint, then re-meshes. eliminates plate-fragment
-    # residuals cleanly without touching the object.
+    # object-footprint hull clip (stage 4 cleanup, non-tsdf).
     use_hull_clip: bool = True
-    hull_margin_m: float = 0.003  # 3mm outward inflation, preserves edges
+    hull_margin_m: float = 0.003
 
-    # dome subtraction (fallback apparatus masking when cad mask disabled).
-    # threshold is loose (8mm) so it only catches obvious hemisphere
-    # geometry seen at oblique arc angles. at overhead (90 deg) this
-    # removes essentially nothing, which is correct - plate cut
-    # already did the work. at 0 or 180 deg, dome subtract removes
-    # the arc-housing points the camera sees at grazing angles.
+    # dome subtraction (legacy apparatus masking fallback).
     dome_reference_path: str = "data/reference/dome_cloud.ply"
     dome_threshold_m: float = 0.008
 
-    # cad-based apparatus masking (replaces dome subtract when enabled).
-    # uses the solidworks assembly stl as ground truth for apparatus
-    # geometry. two filters: points near apparatus surfaces are rejected
-    # (plate, arc, frame, control box), and points outside the apparatus
-    # bbox + margin are rejected (walls, ceiling, stray returns).
-    # only points inside the envelope but off all surfaces survive - by
-    # construction, that's the object. default ON; pass --no-cad-mask
-    # to fall back to dome subtraction.
+    # cad-based apparatus masking (default).
     use_cad_mask: bool = True
     cad_stl_path: str = "data/reference/apparatus.STL"
     cad_scale: float = 0.001
@@ -330,13 +302,11 @@ class PipelineConfig:
     cad_surface_threshold_m: float = 0.003
     cad_bounding_margin_m: float = 0.01
 
-    # icp registration (clouds already in plate frame, so initial is identity)
+    # icp registration
     icp_voxel_size: float = 0.005
     icp_max_distance: float = 0.05
 
-    # processing. tuned for post-subtraction clouds of a few thousand points.
-    # voxel 2mm preserves mm-scale detail; nb_neighbors 20 avoids over-culling
-    # small clouds; std_ratio 2.0 keeps object edges.
+    # processing
     voxel_size: float = 0.002
     outlier_nb_neighbors: int = 20
     outlier_std_ratio: float = 2.0
@@ -346,15 +316,8 @@ class PipelineConfig:
     mesh_method: str = "poisson"
     poisson_depth: int = 7
     poisson_scale: float = 1.1
-    # alpha shape reconstruction (better for open surfaces / single-angle captures).
-    # smaller alpha = tighter fit. 0.01 = 10mm, tune per object scale.
     alpha_shape_alpha: float = 0.010
-    # ball pivoting reconstruction (good for uniformly-dense clouds).
-    # radii in meters; smallest should be ~voxel_size, largest ~3-4x.
     ball_pivoting_radii: list = field(default_factory=lambda: [0.003, 0.006, 0.012])
-    # single-angle mode: extrude the heightmap mesh into a watertight
-    # solid so OCL gets a closed surface for dropcutter. set True when
-    # only the top is scanned (one arc angle); leave False for full sweeps.
     extrude_to_plate: bool = False
 
     # tsdf (volumetric fusion, replaces icp+poisson when mesh_method="tsdf")
@@ -369,10 +332,7 @@ class PipelineConfig:
     tsdf_cluster_min_points: int = 50
     tsdf_visual_preset: int = 4
 
-    # capture-time color filtering.
-    # drop near-black pixels (e.g. matte black cloth background). per-channel:
-    # a point is removed only if r, g, b are all below this value (0-255).
-    # None disables the filter entirely.
+    # capture-time color filtering
     filter_black_threshold: int = None
 
     # toolpath
@@ -497,7 +457,6 @@ class PipelineConfig:
                 if val is not None:
                     overrides[field_name] = val
 
-        # cad origin offset is nested in yaml, handle separately
         proc_path = config_dir / "processing.yaml"
         if proc_path.exists():
             with open(proc_path) as f:
@@ -688,10 +647,6 @@ class ScanPipeline:
         self._save(self.combined_cloud, "raw_combined.ply")
         logger.info(f"after icp: {len(self.combined_cloud.points)} points")
 
-        # plate surface cut: primary background removal.
-        # adaptive mode fits a plane and cuts within buffer_m above it;
-        # static mode cuts at a fixed z. adaptive is the default because
-        # it hugs the plate tighter without risking object bases.
         if self.config.use_adaptive_plate_cut:
             self.combined_cloud = _plate_surface_cut_adaptive(
                 self.combined_cloud,
@@ -704,10 +659,6 @@ class ScanPipeline:
             )
         self._save(self.combined_cloud, "after_plate_cut.ply")
 
-        # apparatus masking: either cad-based (default) or dome subtract (fallback).
-        # cad mask uses the full solidworks assembly stl as ground truth - rejects
-        # any point near an apparatus surface or outside the apparatus envelope.
-        # dome subtract is the legacy path using a sampled dome reference ply.
         if self.config.use_cad_mask:
             self.combined_cloud = apply_cad_mask(
                 self.combined_cloud,
@@ -742,9 +693,9 @@ class ScanPipeline:
 
         if len(self.combined_cloud.points) == 0:
             raise RuntimeError(
-            "combined cloud is empty. check stage 2 background removal - "
-            "the plate cut and apparatus mask may be too aggressive."
-        )
+                "combined cloud is empty. check stage 2 background removal - "
+                "the plate cut and apparatus mask may be too aggressive."
+            )
         pcd = PointCloud(np.asarray(self.combined_cloud.points))
         if self.combined_cloud.has_colors():
             pcd.pcd.colors = self.combined_cloud.colors
@@ -771,9 +722,9 @@ class ScanPipeline:
 
         per-position depth+color frames are optionally masked against the cad
         apparatus (option A, pre-integration), then integrated into a scalable
-        tsdf volume. after integration, the extracted cloud can optionally be
-        masked again via apply_cad_mask (option B) and cluster-filtered to
-        drop disconnected noise.
+        tsdf volume. after integration, a plate-frame box clip restricts the
+        output to the known object envelope, and an optional cad mask +
+        cluster filter cleans up remaining noise.
 
         inputs:
             self.position_frames: list of (angle, frames, intrinsics, pose,
@@ -829,22 +780,59 @@ class ScanPipeline:
         logger.info(f"integrated {total_frames} frames from "
                     f"{len(self.position_frames)} positions")
 
-        # extract cloud and (default) mesh from the volume
+        # extract cloud and mesh from the volume
         cloud = integrator.extract_cloud()
         mesh = integrator.extract_mesh()
 
         self._save(cloud, "tsdf_cloud.ply")
         self._save(mesh, "tsdf_mesh.ply")
 
-        # optional post-hoc cad mask + cluster filter on the extracted cloud.
-        # this runs EVEN when cad_mask_post=False, if cluster filtering alone
-        # is requested -- the cad mask function handles clustering too.
+        # working-volume filter: plate-frame box clip on both cloud and mesh.
+        # this is the outermost envelope filter, replacing the earlier bandaid
+        # approach of mesh-native cluster filtering. anything outside the
+        # plate's known object envelope (cables, table edge, room geometry)
+        # is dropped regardless of connectivity. cad mask handles apparatus
+        # surfaces it knows about; this catches everything else.
+        logger.info("applying plate-frame clip to tsdf output...")
+        n_cloud_before = len(cloud.points)
+        cloud = _plate_frame_clip(
+            cloud,
+            xy_extent_m=self.config.plate_xy_extent_m,
+            z_min_m=self.config.plate_z_min_m,
+            z_max_m=self.config.plate_z_max_m,
+        )
+        logger.info(
+            f"cloud plate-frame clip: {n_cloud_before} -> {len(cloud.points)} points"
+        )
+        bbox = o3d.geometry.AxisAlignedBoundingBox(
+            min_bound=np.array([
+                -self.config.plate_xy_extent_m,
+                -self.config.plate_xy_extent_m,
+                self.config.plate_z_min_m,
+            ]),
+            max_bound=np.array([
+                self.config.plate_xy_extent_m,
+                self.config.plate_xy_extent_m,
+                self.config.plate_z_max_m,
+            ]),
+        )
+        n_mesh_before = len(mesh.triangles)
+        mesh = mesh.crop(bbox)
+        logger.info(
+            f"mesh plate-frame clip: {n_mesh_before} -> {len(mesh.triangles)} triangles"
+        )
+        self._save(cloud, "tsdf_cloud_clipped.ply")
+        self._save(mesh, "tsdf_mesh_clipped.ply")
+
+        # optional post-hoc cad mask + cluster filter on the clipped cloud.
+        # runs when cad_mask_post OR cluster filtering is requested -- the
+        # cad mask function handles clustering too.
         needs_post = (
             self.config.tsdf_cad_mask_post
             or self.config.tsdf_keep_largest_cluster
         )
         if needs_post:
-            logger.info("post-integration cleanup on extracted cloud...")
+            logger.info("post-clip cloud cluster filter...")
             if self.config.tsdf_cad_mask_post:
                 cloud = apply_cad_mask(
                     cloud,
@@ -857,7 +845,7 @@ class ScanPipeline:
                     cluster_eps_m=self.config.tsdf_cluster_eps_m,
                     cluster_min_points=self.config.tsdf_cluster_min_points,
                 )
-            elif self.config.tsdf_keep_largest_cluster:
+            else:
                 # cluster-only, no additional cad mask (surface_threshold=0,
                 # bounding_margin very large so nothing gets rejected by them)
                 cloud = apply_cad_mask(
@@ -873,11 +861,9 @@ class ScanPipeline:
                 )
             self._save(cloud, "tsdf_cloud_filtered.ply")
 
-            # if cad_mask_post was enabled, we've lost the tsdf direct mesh;
-            # re-mesh via poisson on the masked cloud (option B path).
+            # if cad_mask_post was enabled, re-mesh via poisson on the masked
+            # cloud (option B path); the tsdf direct mesh gets replaced.
             if self.config.tsdf_cad_mask_post:
-                from processing.mesh import MeshReconstructor
-                from processing.pointcloud import PointCloud
                 logger.info("poisson re-mesh on masked cloud...")
                 pc = PointCloud(np.asarray(cloud.points))
                 if cloud.has_colors():
@@ -890,41 +876,6 @@ class ScanPipeline:
                 mesh = mesh_result.mesh
                 self._save(mesh, "tsdf_mesh_poisson.ply")
 
-        # mesh-native cluster filter: keep only the largest connected component
-        # of the tsdf mesh, matching what cluster-filtering the cloud did for
-        # tsdf_cloud_filtered.ply. this prevents the toolpath stage from seeing
-        # apparatus-fragment triangles that the cad mask missed.
-        if self.config.tsdf_keep_largest_cluster and len(mesh.triangles) > 0 and len(cloud.points) > 0:
-            # transfer the cloud-level cluster decision onto the mesh.
-            # for each triangle, keep it only if at least one vertex is
-            # within cluster_eps_m of any point in the cluster-filtered
-            # cloud. this drops the long ribbon artifact that mesh-native
-            # connectivity preserves but the cloud dbscan correctly rejects.
-            cloud_kdtree = o3d.geometry.KDTreeFlann(cloud)
-            verts = np.asarray(mesh.vertices)
-            tris = np.asarray(mesh.triangles)
-            max_dist = self.config.tsdf_cluster_eps_m
-            max_dist_sq = max_dist * max_dist
-
-            vert_near_cloud = np.zeros(len(verts), dtype=bool)
-            for i, v in enumerate(verts):
-                _, _, dist_sq = cloud_kdtree.search_knn_vector_3d(v, 1)
-                if dist_sq and dist_sq[0] < max_dist_sq:
-                    vert_near_cloud[i] = True
-
-            tri_keep = vert_near_cloud[tris].any(axis=1)
-            n_tri_before = len(tris)
-            remove_mask = ~tri_keep
-            mesh.remove_triangles_by_mask(remove_mask.tolist())
-            mesh.remove_unreferenced_vertices()
-
-            logger.info(
-                f"mesh proximity filter: kept triangles within "
-                f"{max_dist*1000:.1f}mm of cluster-filtered cloud, "
-                f"{n_tri_before} -> {len(mesh.triangles)} triangles"
-            )
-            self._save(mesh, "tsdf_mesh_filtered.ply")
-
         self.combined_cloud = cloud
         self.processed_cloud = cloud
         self.mesh = mesh
@@ -933,13 +884,17 @@ class ScanPipeline:
             f"stage tsdf complete in {time.time() - start:.1f}s: "
             f"cloud {len(cloud.points)} pts, mesh {len(mesh.vertices)} verts"
         )
+
     # stage 4: mesh
 
     def stage_4_mesh(self):
         """surface reconstruction. method selectable via config.mesh_method.
         with use_hull_clip, does two passes: first mesh finds the object
         footprint, second mesh runs on the XY-clipped cloud to remove
-        plate-fragment residuals."""
+        plate-fragment residuals.
+
+        for tsdf, the mesh is already extracted in stage_tsdf_integrate; this
+        stage only does marching-cubes artifact cleanup and optional extrude."""
         logger.info("=== stage 4: mesh ===")
         start = time.time()
 
@@ -964,9 +919,6 @@ class ScanPipeline:
             logger.info(
                 f"mesh cleanup: {n_before} -> {len(self.mesh.triangles)} triangles"
             )
-            # jump to post-mesh cleanup (extrude_to_plate etc). for now the
-            # rest of the method is the poisson/bpa/alpha path, which we skip
-            # entirely for tsdf. post-mesh cleanup happens inline here:
             if self.config.extrude_to_plate:
                 from processing.mesh import Mesh
                 m = Mesh()
@@ -1010,13 +962,10 @@ class ScanPipeline:
         # false single-component meshes into the real multi-component
         # topology, which lets remove_small_components actually do its job.
         mesh.split_non_manifold_vertices()
-
         mesh.remove_small_components()
 
         # hull clip: find largest component, take XY convex hull with margin,
         # drop any processed-cloud point outside that footprint, re-mesh.
-        # this kills plate-fragment residuals that slipped past the adaptive
-        # plate cut without risking the object itself.
         if self.config.use_hull_clip:
             logger.info("hull clip: extracting object footprint from first-pass mesh")
             obj_verts = _object_component_vertices(mesh)
@@ -1035,7 +984,6 @@ class ScanPipeline:
             )
             self._save(clipped, "after_hull_clip.ply")
 
-            # rebuild a PointCloud wrapper so reconstructor can use it
             clipped_pc = PointCloud(np.asarray(clipped.points))
             if clipped.has_colors():
                 clipped_pc.pcd.colors = clipped.colors
@@ -1044,7 +992,6 @@ class ScanPipeline:
             else:
                 clipped_pc.estimate_normals(radius=self.config.normal_radius)
 
-            # second mesh pass on the clipped cloud
             mesh = reconstructor.reconstruct(
                 clipped_pc,
                 method=method,
@@ -1055,9 +1002,6 @@ class ScanPipeline:
             mesh.remove_small_components()
             logger.info(f"hull clip: re-meshed, {mesh.triangle_count} triangles")
 
-        # close single-angle heightmap into a watertight solid so OCL's
-        # dropcutter gets a proper closed surface to sample. runs after
-        # the cleanup above so the boundary is one clean loop.
         if self.config.extrude_to_plate:
             logger.info("extruding heightmap to plate (single-angle mode)")
             mesh.extrude_to_plate(plate_z=0.0)
@@ -1070,6 +1014,8 @@ class ScanPipeline:
 
         logger.info(f"stage 4 complete: {mesh.triangle_count} triangles "
                     f"in {time.time() - start:.1f}s")
+
+    # stage 5: toolpath
 
     def stage_5_toolpath(self):
         """opencamlib surface dropcutter + g-code."""
@@ -1087,7 +1033,6 @@ class ScanPipeline:
         generator = ToolpathGenerator(cutter=cutter)
 
         # load_mesh scales m -> mm and shifts min corner to (0,0), top to Z=0.
-        # bounds come back in mm already in the shifted coordinate space.
         bounds = generator.load_mesh(self.mesh)
 
         passes = generator.surface_dropcutter(
@@ -1111,7 +1056,6 @@ class ScanPipeline:
 
         logger.info(f"stage 5 complete: {len(writer.lines)} lines, "
                     f"est. {writer.estimate_time():.1f} min in {time.time() - start:.1f}s")
-
 
     # stage 6: cnc execution
 
@@ -1188,13 +1132,13 @@ class ScanPipeline:
             }
         else:
             stages = {
-            1: ("capture", self.stage_1_capture),
-            2: ("register", self.stage_2_register),
-            3: ("process", self.stage_3_process),
-            4: ("mesh", self.stage_4_mesh),
-            5: ("toolpath", self.stage_5_toolpath),
-            6: ("execute", lambda: self.stage_6_execute(dry_run=dry_run)),
-        }
+                1: ("capture", self.stage_1_capture),
+                2: ("register", self.stage_2_register),
+                3: ("process", self.stage_3_process),
+                4: ("mesh", self.stage_4_mesh),
+                5: ("toolpath", self.stage_5_toolpath),
+                6: ("execute", lambda: self.stage_6_execute(dry_run=dry_run)),
+            }
 
         logger.info(f"pipeline: stages {start_stage}-{end_stage}")
         t_start = time.time()
