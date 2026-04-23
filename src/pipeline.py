@@ -894,24 +894,35 @@ class ScanPipeline:
         # of the tsdf mesh, matching what cluster-filtering the cloud did for
         # tsdf_cloud_filtered.ply. this prevents the toolpath stage from seeing
         # apparatus-fragment triangles that the cad mask missed.
-        if self.config.tsdf_keep_largest_cluster and len(mesh.triangles) > 0:
-            triangle_clusters, cluster_n_triangles, _ = (
-                mesh.cluster_connected_triangles()
+        if self.config.tsdf_keep_largest_cluster and len(mesh.triangles) > 0 and len(cloud.points) > 0:
+            # transfer the cloud-level cluster decision onto the mesh.
+            # for each triangle, keep it only if at least one vertex is
+            # within cluster_eps_m of any point in the cluster-filtered
+            # cloud. this drops the long ribbon artifact that mesh-native
+            # connectivity preserves but the cloud dbscan correctly rejects.
+            cloud_kdtree = o3d.geometry.KDTreeFlann(cloud)
+            verts = np.asarray(mesh.vertices)
+            tris = np.asarray(mesh.triangles)
+            max_dist = self.config.tsdf_cluster_eps_m
+            max_dist_sq = max_dist * max_dist
+
+            vert_near_cloud = np.zeros(len(verts), dtype=bool)
+            for i, v in enumerate(verts):
+                _, _, dist_sq = cloud_kdtree.search_knn_vector_3d(v, 1)
+                if dist_sq and dist_sq[0] < max_dist_sq:
+                    vert_near_cloud[i] = True
+
+            tri_keep = vert_near_cloud[tris].any(axis=1)
+            n_tri_before = len(tris)
+            remove_mask = ~tri_keep
+            mesh.remove_triangles_by_mask(remove_mask.tolist())
+            mesh.remove_unreferenced_vertices()
+
+            logger.info(
+                f"mesh proximity filter: kept triangles within "
+                f"{max_dist*1000:.1f}mm of cluster-filtered cloud, "
+                f"{n_tri_before} -> {len(mesh.triangles)} triangles"
             )
-            triangle_clusters = np.asarray(triangle_clusters)
-            cluster_n_triangles = np.asarray(cluster_n_triangles)
-            if len(cluster_n_triangles) > 0:
-                biggest = int(np.argmax(cluster_n_triangles))
-                n_tri_before = len(mesh.triangles)
-                keep_mask = triangle_clusters == biggest
-                remove_mask = ~keep_mask
-                mesh.remove_triangles_by_mask(remove_mask)
-                mesh.remove_unreferenced_vertices()
-                logger.info(
-                    f"mesh cluster filter: kept largest of "
-                    f"{len(cluster_n_triangles)} components, "
-                    f"{n_tri_before} -> {len(mesh.triangles)} triangles"
-                )
             self._save(mesh, "tsdf_mesh_filtered.ply")
 
         self.combined_cloud = cloud
