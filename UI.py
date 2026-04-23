@@ -8,6 +8,7 @@ import sys
 import queue
 import threading
 import numpy as np
+import subprocess
 import os
 os.environ["QT_QPA_PLATFORM"] = "xcb"
 os.environ["LIBGL_ALWAYS_SOFTWARE"] = "1"           # <-- add
@@ -1450,39 +1451,60 @@ class ScanToMillUI(QMainWindow):
 
     # ── Scan Actions ──────────────────────────────────────────────────────────
     def _on_start(self):
-        if hasattr(self, "_stepped_worker") and self._stepped_worker.isRunning():
-            self._log("[STEP] Already running.")
-            return
+    """Launch the external pipeline script in a terminal window.
 
-        self._log("[SYS] Scan started — homing first, then stepped scan.")
+    Replaces the in-UI stepped-scan workflow entirely — run_pipeline.py
+    drives the PLC and camera on its own. No Modbus commands, no pipeline
+    socket messages, and no worker threads are spawned from here.
+    """
+    self._log("[SYS] START pressed — launching run_pipeline.py in a new terminal.")
 
-        # Tell server.py to prepare a fresh pipeline for this scan session.
-        # Even if the camera is offline, sending this is harmless; it just
-        # won't reach anyone.
-        self._pipeline.send_cmd(cmd="start_scan_session")
+    # Launcher script. Final 'read' keeps the window open so the user
+    # can see the output after the pipeline exits.
+    home = os.path.expanduser("~")
+    script_body = (
+        "#!/bin/bash\n"
+        f"cd {home}\n"
+        "source pipeline-env/bin/activate\n"
+        "cd Capstone-Design-2026\n"
+        "python scripts/run_pipeline.py --single-angle 90 --skip-execute\n"
+        "echo\n"
+        "echo '--- Pipeline finished. Press Enter to close this window. ---'\n"
+        "read\n"
+    )
+    script_path = "/tmp/scan_to_mill_launch.sh"
+    try:
+        with open(script_path, "w") as f:
+            f.write(script_body)
+        os.chmod(script_path, 0o700)
+    except OSError as e:
+        self._log(f"[SYS] Could not write launcher script: {e}")
+        return
 
-        # Phase: HOMING
-        self._scan_phase = "homing"
-        self._scan_running = True
-        self.btn_start.setEnabled(False)
-        self.btn_stop.setEnabled(True)
-        self.btn_export.setEnabled(False)
+    # Try a few terminal emulators in preference order. lxterminal is the
+    # default on Raspberry Pi OS Bookworm; x-terminal-emulator is the
+    # Debian alias; xterm is the universal fallback.
+    for term_cmd in (
+        ["lxterminal", "-e", script_path],
+        ["x-terminal-emulator", "-e", script_path],
+        ["xterm", "-e", script_path],
+    ):
+        try:
+            subprocess.Popen(term_cmd)
+            self._log(f"[SYS] Launched: {' '.join(term_cmd)}")
+            break
+        except FileNotFoundError:
+            continue
+    else:
+        self._log("[SYS] !! No terminal emulator found "
+                  "(tried lxterminal, x-terminal-emulator, xterm).")
+        return
 
-        self.progress_bar.setValue(0)
-        self.progress_bar.setFormat("HOMING...")   # no % while homing
-        self.lbl_stage.setText("HOMING")
-        self.lbl_elapsed.setText("00:00")
-        self.lbl_remaining.setText("—")
-        self.lbl_pts_stat.setText("—")
-
-        # Start elapsed timer now (homing time counts as part of the scan)
-        self._scan_elapsed = 0
-        self._scan_timer = QTimer()
-        self._scan_timer.timeout.connect(self._tick_elapsed)
-        self._scan_timer.start(1000)
-
-        # Fire the firmware's home→scan→return; we'll interrupt it once HOMED flips high
-        self._modbus.send_command(CCMD_RUN_1)
+    # Minimal UI feedback — no phase transitions, no timers, no workers.
+    self.btn_start.setEnabled(False)
+    self.btn_stop.setEnabled(True)
+    self.progress_bar.setFormat("RUNNING EXTERNAL PIPELINE")
+    self.lbl_stage.setText("EXTERNAL")
 
     def _on_stepped_scan(self):
         """Run a stepped scan: 0, 45, 90, 135, 180 degrees, pausing at each."""
