@@ -342,7 +342,7 @@ class RealSenseCapture:
             # no rs filters in tsdf path: tsdf handles noise reduction
             # at the voxel level across frames.
 
-            depth_array = np.asanyarray(depth.get_data())
+            depth_array = np.asanyarray(depth.get_data()).copy()
             color_array = np.asanyarray(color.get_data())[:, :, ::-1].copy()
 
             if intrinsics is None:
