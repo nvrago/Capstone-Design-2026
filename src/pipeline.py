@@ -357,6 +357,18 @@ class PipelineConfig:
     # only the top is scanned (one arc angle); leave False for full sweeps.
     extrude_to_plate: bool = False
 
+    # tsdf (volumetric fusion, replaces icp+poisson when mesh_method="tsdf")
+    tsdf_voxel_size_m: float = 0.001
+    tsdf_sdf_trunc_m: float = 0.004
+    tsdf_depth_trunc_m: float = 0.5
+    tsdf_cad_mask_depth: bool = True
+    tsdf_mask_threshold_m: float = 0.010
+    tsdf_cad_mask_post: bool = False
+    tsdf_keep_largest_cluster: bool = True
+    tsdf_cluster_eps_m: float = 0.005
+    tsdf_cluster_min_points: int = 50
+    tsdf_visual_preset: int = 4
+
     # capture-time color filtering.
     # drop near-black pixels (e.g. matte black cloth background). per-channel:
     # a point is removed only if r, g, b are all below this value (0-255).
@@ -423,6 +435,16 @@ class PipelineConfig:
                 "mesh.poisson.scale": "poisson_scale",
                 "mesh.alpha_shape.alpha": "alpha_shape_alpha",
                 "mesh.ball_pivoting.radii": "ball_pivoting_radii",
+                "mesh.tsdf.voxel_size_m": "tsdf_voxel_size_m",
+                "mesh.tsdf.sdf_trunc_m": "tsdf_sdf_trunc_m",
+                "mesh.tsdf.depth_trunc_m": "tsdf_depth_trunc_m",
+                "mesh.tsdf.cad_mask_depth": "tsdf_cad_mask_depth",
+                "mesh.tsdf.mask_threshold_m": "tsdf_mask_threshold_m",
+                "mesh.tsdf.cad_mask_post": "tsdf_cad_mask_post",
+                "mesh.tsdf.keep_largest_cluster": "tsdf_keep_largest_cluster",
+                "mesh.tsdf.cluster_eps_m": "tsdf_cluster_eps_m",
+                "mesh.tsdf.cluster_min_points": "tsdf_cluster_min_points",
+                "mesh.tsdf.visual_preset": "tsdf_visual_preset",
                 "mesh.hull_clip": "use_hull_clip",
                 "mesh.hull_margin_m": "hull_margin_m",
                 "toolpath.cutter.diameter": "cutter_diameter",
@@ -503,6 +525,7 @@ class ScanPipeline:
         self.position_clouds: list[tuple[float, o3d.geometry.PointCloud]] = []
         self.combined_cloud: o3d.geometry.PointCloud = None
         self.processed_cloud: o3d.geometry.PointCloud = None
+        self.position_frames: list = []  # for tsdf path
         self.mesh = None
         self.gcode_path: Path = None
 
@@ -571,6 +594,9 @@ class ScanPipeline:
             arc_radius_m=self.config.arc_radius_m,
             arc_center_z_m=self.config.arc_center_z_m,
             filter_black_threshold=self.config.filter_black_threshold,
+            visual_preset=(self.config.tsdf_visual_preset
+                           if self.config.mesh_method == "tsdf"
+                           else 3),
         )
         self.scanner.start()
         logger.info("hardware initialized")
@@ -594,6 +620,7 @@ class ScanPipeline:
 
         self.arc.home()
         self.position_clouds.clear()
+        self.position_frames.clear()
 
         positions = np.arange(
             self.config.arc_start_deg,
@@ -611,24 +638,33 @@ class ScanPipeline:
             self.arc.move_to_steps(self._angle_to_steps(angle))
             time.sleep(0.3)
 
-            pcd = self.scanner.capture(angle_deg=float(angle))
+            if self.config.mesh_method == "tsdf":
+                frames, intrinsics, pose, depth_scale_m = \
+                    self.scanner.capture_frames(angle_deg=float(angle))
+                if not frames:
+                    logger.warning(f"no frames at {angle:.1f} deg, skipping")
+                    continue
+                self.position_frames.append(
+                    (float(angle), frames, intrinsics, pose, depth_scale_m)
+                )
+                logger.info(f"captured {len(frames)} frames at {angle:.1f} deg")
+            else:
+                pcd = self.scanner.capture(angle_deg=float(angle))
+                if pcd is None or len(pcd.points) == 0:
+                    logger.warning(f"empty capture at {angle:.1f} deg, skipping")
+                    continue
+                before = len(pcd.points)
+                pcd = self._clip(pcd)
+                logger.info(f"clip: {len(pcd.points)}/{before} points kept")
+                if len(pcd.points) == 0:
+                    logger.warning(f"clip removed all points at {angle:.1f} deg")
+                    continue
+                self._save(pcd, f"position_clouds/pos_{angle:.1f}.ply")
+                self.position_clouds.append((float(angle), pcd))
 
-            if pcd is None or len(pcd.points) == 0:
-                logger.warning(f"empty capture at {angle:.1f} deg, skipping")
-                continue
-
-            before = len(pcd.points)
-            pcd = self._clip(pcd)
-            logger.info(f"clip: {len(pcd.points)}/{before} points kept")
-
-            if len(pcd.points) == 0:
-                logger.warning(f"clip removed all points at {angle:.1f} deg")
-                continue
-
-            self._save(pcd, f"position_clouds/pos_{angle:.1f}.ply")
-            self.position_clouds.append((float(angle), pcd))
-
-        logger.info(f"stage 1 complete: {len(self.position_clouds)} positions "
+        n_positions = (len(self.position_frames) if self.config.mesh_method == "tsdf"
+                       else len(self.position_clouds))
+        logger.info(f"stage 1 complete: {n_positions} positions "
                     f"in {time.time() - start:.1f}s")
 
     # stage 2: register + background removal
@@ -728,6 +764,140 @@ class ScanPipeline:
 
         logger.info(f"stage 3 complete: {len(pcd)} points in {time.time() - start:.1f}s")
 
+    # stage 2+3 replacement when mesh_method="tsdf"
+
+    def stage_tsdf_integrate(self):
+        """tsdf volumetric fusion: replaces stages 2 (register) and 3 (process).
+
+        per-position depth+color frames are optionally masked against the cad
+        apparatus (option A, pre-integration), then integrated into a scalable
+        tsdf volume. after integration, the extracted cloud can optionally be
+        masked again via apply_cad_mask (option B) and cluster-filtered to
+        drop disconnected noise.
+
+        inputs:
+            self.position_frames: list of (angle, frames, intrinsics, pose,
+                                           depth_scale_m) tuples from stage 1.
+        outputs:
+            self.combined_cloud: tsdf-extracted point cloud (plate frame).
+            self.processed_cloud: same as combined_cloud (for pipeline consistency).
+            self.mesh: tsdf-extracted triangle mesh (plate frame), may be
+                       replaced by poisson re-mesh if cad_mask_post is set.
+        """
+        from processing.tsdf import TSDFIntegrator
+        from processing.cad_mask import (
+            build_depth_mask_from_cad,
+            apply_cad_mask,
+        )
+
+        logger.info("=== stage tsdf: integrate ===")
+        start = time.time()
+
+        if not self.position_frames:
+            raise RuntimeError(
+                "no position frames captured. "
+                "stage 1 must run with mesh_method='tsdf' to collect frames."
+            )
+
+        integrator = TSDFIntegrator(
+            voxel_size_m=self.config.tsdf_voxel_size_m,
+            sdf_trunc_m=self.config.tsdf_sdf_trunc_m,
+            depth_trunc_m=self.config.tsdf_depth_trunc_m,
+            color=True,
+        )
+
+        total_frames = 0
+        for angle, frames, intrinsics, pose, depth_scale_m in self.position_frames:
+            logger.info(
+                f"position {angle:+.1f} deg: integrating {len(frames)} frames"
+            )
+
+            for depth_arr, color_arr in frames:
+                if self.config.tsdf_cad_mask_depth:
+                    depth_arr = build_depth_mask_from_cad(
+                        depth_arr, intrinsics, pose, depth_scale_m,
+                        stl_path=Path(self.config.cad_stl_path),
+                        scale=self.config.cad_scale,
+                        origin_offset=self.config.cad_origin_offset,
+                        match_threshold_m=self.config.tsdf_mask_threshold_m,
+                    )
+                integrator.integrate_frame(
+                    depth_arr, color_arr, intrinsics, pose, depth_scale_m,
+                )
+                total_frames += 1
+
+        logger.info(f"integrated {total_frames} frames from "
+                    f"{len(self.position_frames)} positions")
+
+        # extract cloud and (default) mesh from the volume
+        cloud = integrator.extract_cloud()
+        mesh = integrator.extract_mesh()
+
+        self._save(cloud, "tsdf_cloud.ply")
+        self._save(mesh, "tsdf_mesh.ply")
+
+        # optional post-hoc cad mask + cluster filter on the extracted cloud.
+        # this runs EVEN when cad_mask_post=False, if cluster filtering alone
+        # is requested -- the cad mask function handles clustering too.
+        needs_post = (
+            self.config.tsdf_cad_mask_post
+            or self.config.tsdf_keep_largest_cluster
+        )
+        if needs_post:
+            logger.info("post-integration cleanup on extracted cloud...")
+            if self.config.tsdf_cad_mask_post:
+                cloud = apply_cad_mask(
+                    cloud,
+                    stl_path=Path(self.config.cad_stl_path),
+                    scale=self.config.cad_scale,
+                    origin_offset=self.config.cad_origin_offset,
+                    surface_threshold_m=self.config.cad_surface_threshold_m,
+                    bounding_margin_m=self.config.cad_bounding_margin_m,
+                    keep_largest_cluster=self.config.tsdf_keep_largest_cluster,
+                    cluster_eps_m=self.config.tsdf_cluster_eps_m,
+                    cluster_min_points=self.config.tsdf_cluster_min_points,
+                )
+            elif self.config.tsdf_keep_largest_cluster:
+                # cluster-only, no additional cad mask (surface_threshold=0,
+                # bounding_margin very large so nothing gets rejected by them)
+                cloud = apply_cad_mask(
+                    cloud,
+                    stl_path=Path(self.config.cad_stl_path),
+                    scale=self.config.cad_scale,
+                    origin_offset=self.config.cad_origin_offset,
+                    surface_threshold_m=0.0,
+                    bounding_margin_m=10.0,
+                    keep_largest_cluster=True,
+                    cluster_eps_m=self.config.tsdf_cluster_eps_m,
+                    cluster_min_points=self.config.tsdf_cluster_min_points,
+                )
+            self._save(cloud, "tsdf_cloud_filtered.ply")
+
+            # if cad_mask_post was enabled, we've lost the tsdf direct mesh;
+            # re-mesh via poisson on the masked cloud (option B path).
+            if self.config.tsdf_cad_mask_post:
+                from processing.mesh import MeshReconstructor
+                from processing.pointcloud import PointCloud
+                logger.info("poisson re-mesh on masked cloud...")
+                pc = PointCloud(np.asarray(cloud.points))
+                if cloud.has_colors():
+                    pc.pcd.colors = cloud.colors
+                reconstructor = MeshReconstructor()
+                mesh_result = reconstructor.poisson_reconstruction(
+                    pc, depth=self.config.poisson_depth,
+                    scale=self.config.poisson_scale,
+                )
+                mesh = mesh_result.mesh
+                self._save(mesh, "tsdf_mesh_poisson.ply")
+
+        self.combined_cloud = cloud
+        self.processed_cloud = cloud
+        self.mesh = mesh
+
+        logger.info(
+            f"stage tsdf complete in {time.time() - start:.1f}s: "
+            f"cloud {len(cloud.points)} pts, mesh {len(mesh.vertices)} verts"
+        )
     # stage 4: mesh
 
     def stage_4_mesh(self):
@@ -744,6 +914,27 @@ class ScanPipeline:
         reconstructor = MeshReconstructor()
 
         method = self.config.mesh_method
+        if method == "tsdf":
+            if self.mesh is None:
+                raise RuntimeError(
+                    "tsdf mesh missing. stage_tsdf_integrate must run first."
+                )
+            logger.info("mesh already extracted by tsdf; skipping reconstruction")
+            # jump to post-mesh cleanup (extrude_to_plate etc). for now the
+            # rest of the method is the poisson/bpa/alpha path, which we skip
+            # entirely for tsdf. post-mesh cleanup happens inline here:
+            if self.config.extrude_to_plate:
+                from processing.mesh import Mesh
+                m = Mesh()
+                m.mesh = self.mesh
+                m.extrude_to_plate()
+                self.mesh = m.mesh
+                logger.info(f"extruded to plate: {len(self.mesh.vertices)} verts")
+            self._save(self.mesh, "mesh.stl")
+            self._save(self.mesh, "mesh.ply")
+            logger.info(f"stage 4 complete (tsdf) in {time.time() - start:.1f}s")
+            return
+
         if method == "poisson":
             kwargs = {
                 "depth": self.config.poisson_depth,
@@ -756,7 +947,7 @@ class ScanPipeline:
         else:
             raise ValueError(
                 f"unknown mesh_method '{method}'. "
-                f"use 'poisson', 'alpha_shape', or 'ball_pivoting'."
+                f"use 'poisson', 'alpha_shape', 'ball_pivoting', or 'tsdf'."
             )
 
         logger.info(f"mesh method: {method} with {kwargs}")
@@ -942,7 +1133,17 @@ class ScanPipeline:
         ))
         logging.getLogger().addHandler(file_handler)
 
-        stages = {
+        if self.config.mesh_method == "tsdf":
+            stages = {
+                1: ("capture", self.stage_1_capture),
+                2: ("tsdf_integrate", self.stage_tsdf_integrate),
+                3: ("skip", lambda: logger.info("stage 3 skipped (tsdf integrates in stage 2)")),
+                4: ("mesh", self.stage_4_mesh),
+                5: ("toolpath", self.stage_5_toolpath),
+                6: ("execute", lambda: self.stage_6_execute(dry_run=dry_run)),
+            }
+        else:
+            stages = {
             1: ("capture", self.stage_1_capture),
             2: ("register", self.stage_2_register),
             3: ("process", self.stage_3_process),

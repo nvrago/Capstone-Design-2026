@@ -88,6 +88,7 @@ class RealSenseCapture:
         arc_radius_m: float = 0.255,
         arc_center_z_m: float = 0.000,
         filter_black_threshold: int = None,
+        visual_preset: int = 3,
     ):
         self.width = width
         self.height = height
@@ -107,6 +108,7 @@ class RealSenseCapture:
         # 0-255 rgb; a point is removed only if r, g, and b are all
         # below the threshold. None disables the filter entirely.
         self.filter_black_threshold = filter_black_threshold
+        self.visual_preset = visual_preset
 
         self.pipeline = rs.pipeline()
         self.config = rs.config()
@@ -184,8 +186,8 @@ class RealSenseCapture:
             depth_sensor = device.first_depth_sensor()
 
             if depth_sensor.supports(rs.option.visual_preset):
-                depth_sensor.set_option(rs.option.visual_preset, 3)
-                logger.info("set depth sensor to high accuracy preset")
+                depth_sensor.set_option(rs.option.visual_preset, self.visual_preset)
+                logger.info(f"set depth sensor visual_preset = {self.visual_preset}")
 
             depth_scale = depth_sensor.get_depth_scale()
             logger.info(f"depth scale: {depth_scale} (meters per unit)")

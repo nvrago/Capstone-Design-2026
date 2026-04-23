@@ -71,3 +71,18 @@ cad_mask:
     z: -0.0945
   surface_threshold_m: 0.003  # 3mm from apparatus surfaces
   bounding_margin_m: 0.01     # 1cm slack on apparatus bbox
+# TSDF volumetric fusion (selected via mesh.method: tsdf)
+# replaces icp + poisson when enabled. per-pose depth frames are fused
+# into a signed distance field, then marching cubes extracts the mesh.
+mesh:
+  tsdf:
+    voxel_size_m: 0.001          # 1mm voxels
+    sdf_trunc_m: 0.004           # 4mm truncation band (~4x voxel)
+    depth_trunc_m: 0.5           # max depth per pixel
+    cad_mask_depth: true         # option A: mask apparatus depth pre-integration
+    mask_threshold_m: 0.010      # depth-mask distance tolerance
+    cad_mask_post: false         # option B: mask cloud post-integration (+poisson)
+    keep_largest_cluster: true   # dbscan filter to keep only the biggest cluster
+    cluster_eps_m: 0.005
+    cluster_min_points: 50
+    visual_preset: 4             # d405 preset: 4=high_density (tsdf averages noise)
