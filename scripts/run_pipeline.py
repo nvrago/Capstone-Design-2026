@@ -4,21 +4,17 @@ run_pipeline.py -- CLI entry point for the scan-to-cnc pipeline
 
 examples:
 
-full automated run, skip cnc execution:
+full automated run (config auto-loaded from ./config/), skip cnc execution:
     python scripts/run_pipeline.py --skip-execute
 
 full run including cnc execution:
     python scripts/run_pipeline.py
 
-single-angle test at 90 deg (carriage stays still, one capture,
-auto-selects ball_pivoting and extrudes to a solid):
+single-angle test at 90 deg (carriage stays still, one capture):
     python scripts/run_pipeline.py --single-angle 90 --skip-execute --mock
 
 single-angle with near-black pixels filtered (matte cloth background):
     python scripts/run_pipeline.py --single-angle 90 --skip-execute --mock --filter-black 40
-
-single-angle without heightmap extrusion (open-surface mesh, for debug):
-    python scripts/run_pipeline.py --single-angle 90 --skip-execute --mock --no-extrude
 
 run with mock arc (no ClearCore hardware):
     python scripts/run_pipeline.py --mock --skip-execute
@@ -41,8 +37,11 @@ use .bag recording instead of live camera:
 dry run (generate gcode but simulate cnc):
     python scripts/run_pipeline.py --dry-run
 
-load config from yaml files:
-    python scripts/run_pipeline.py --config config/
+load config from a different directory:
+    python scripts/run_pipeline.py --config other_config/
+
+disable config loading entirely (use dataclass defaults):
+    python scripts/run_pipeline.py --no-config
 
 verbose logging:
     python scripts/run_pipeline.py -v
@@ -65,10 +64,13 @@ def parse_args():
         epilog=__doc__,
     )
 
-    # config
-    p.add_argument("--config", "-c", type=str, default=None,
-                   help="config directory with yaml files (optional, "
-                        "CLI args override yaml values)")
+    # config. default loads from ./config/. pass --config <dir> to override,
+    # or --no-config to skip yaml entirely and use dataclass defaults.
+    p.add_argument("--config", "-c", type=str, default="config",
+                   help="config directory with yaml files "
+                        "(default: ./config/; CLI args override yaml)")
+    p.add_argument("--no-config", action="store_true",
+                   help="skip yaml loading entirely, use dataclass defaults")
 
     # stage control
     p.add_argument("--start-stage", type=int, default=1,
@@ -101,10 +103,7 @@ def parse_args():
     p.add_argument("--single-angle", type=float, default=None,
                    help="capture a single angle only (e.g. --single-angle 90 "
                         "for overhead). overrides --arc-start/end/step. useful "
-                        "for 1D testing without carriage motion. when set, "
-                        "auto-selects ball_pivoting meshing and extrudes the "
-                        "heightmap into a closed solid (use --no-extrude to "
-                        "skip the extrusion).")
+                        "for 1D testing without carriage motion.")
 
     # capture
     p.add_argument("--frames", type=int, default=None,
@@ -113,35 +112,44 @@ def parse_args():
                    help="drop near-black pixels from capture (0-255). typical "
                         "values 30-60 for matte black cloth backgrounds. omit "
                         "to disable. per-channel: a point is removed only if "
-                        "r, g, b are ALL below the threshold, which protects "
-                        "dark-but-not-black object regions.")
+                        "r, g, b are ALL below the threshold.")
 
-    # processing
+    # legacy flags. kept for backwards compat with team scripts but
+    # flagged as no-ops in the tsdf pipeline. still applied to the
+    # (now-ignored) config fields so nothing crashes.
     p.add_argument("--voxel-size", type=float, default=None,
-                   help="voxel downsample size in meters")
+                   help="[legacy] pre-tsdf voxel downsample. no-op.")
     p.add_argument("--poisson-depth", type=int, default=None,
-                   help="poisson reconstruction depth")
+                   help="[legacy] poisson depth. no-op; tsdf uses marching cubes.")
     p.add_argument("--mesh-method", type=str, default=None,
-                   choices=["poisson", "alpha_shape", "ball_pivoting"],
-                   help="mesh reconstruction method. if omitted: ball_pivoting "
-                        "for --single-angle runs, poisson for full arc sweeps. "
-                        "explicit value always wins. poisson builds closed "
-                        "watertight meshes (best for full multi-angle scans). "
-                        "alpha_shape builds open surfaces (tight-fitting, may "
-                        "hole). ball_pivoting builds surface strips from "
-                        "uniformly-dense clouds.")
+                   choices=["poisson", "alpha_shape", "ball_pivoting", "tsdf"],
+                   help="[legacy] mesh method. no-op; tsdf always uses "
+                        "marching cubes from the fused volume.")
     p.add_argument("--alpha", type=float, default=None,
-                   help="alpha value for alpha_shape mesh method, meters "
-                        "(default: 0.010)")
+                   help="[legacy] alpha_shape alpha. no-op.")
     p.add_argument("--no-extrude", action="store_true",
-                   help="skip heightmap-to-solid extrusion in single-angle "
-                        "mode. default: extrude whenever --single-angle is set.")
+                   help="[legacy] disable heightmap extrusion. no-op; "
+                        "tsdf produces its own mesh topology.")
     p.add_argument("--dome-threshold", type=float, default=None,
-                   help="dome subtraction threshold in meters (default: 0.003)")
+                   help="[legacy] dome subtract threshold. no-op; "
+                        "tsdf pipeline uses a plate-frame box clip instead.")
     p.add_argument("--plate-z-cut", type=float, default=None,
-                   help="plate surface z cut in meters (default: 0.003). "
-                        "drops all points at or below this height, cleanly "
-                        "removing the plate plane.")
+                   help="[legacy] static plate-surface z cut. no-op; "
+                        "see clip.z_min_m in processing.yaml instead.")
+
+    # tsdf-specific tunables (new)
+    p.add_argument("--tsdf-voxel", type=float, default=None,
+                   help="tsdf voxel size in meters (default: 0.001)")
+    p.add_argument("--tsdf-sdf-trunc", type=float, default=None,
+                   help="tsdf sdf truncation in meters (default: 0.004)")
+    p.add_argument("--tsdf-depth-trunc", type=float, default=None,
+                   help="tsdf depth truncation in meters (default: 0.5)")
+    p.add_argument("--clip-z-min", type=float, default=None,
+                   help="plate-frame z_min clip in meters (default: 0.002). "
+                        "drops plate surface + noise.")
+    p.add_argument("--clip-z-max", type=float, default=None,
+                   help="plate-frame z_max clip in meters (default: 0.100). "
+                        "max object height.")
 
     # output
     p.add_argument("--data-dir", type=str, default=None,
@@ -154,6 +162,12 @@ def parse_args():
     return p.parse_args()
 
 
+def _warn_legacy(log, flag_name: str, value) -> None:
+    log.warning(
+        f"[legacy flag] {flag_name}={value} is a no-op in the tsdf pipeline"
+    )
+
+
 def main():
     args = parse_args()
 
@@ -162,38 +176,25 @@ def main():
         level=level,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
+    log = logging.getLogger("run_pipeline")
 
-    if args.config:
-        config = PipelineConfig.from_yaml(args.config)
-    else:
+    # config auto-load from ./config/ by default. --no-config skips it.
+    if args.no_config:
+        log.info("skipping yaml, using PipelineConfig dataclass defaults")
         config = PipelineConfig()
+    else:
+        config_dir = args.config
+        log.info(f"loading config from {config_dir}/")
+        config = PipelineConfig.from_yaml(config_dir)
 
     # single-angle shortcut: one capture at the specified angle.
-    # sets start = end = angle and step = 1 (any nonzero value works since
-    # arange produces a single element when end == start).
     if args.single_angle is not None:
         config.arc_start_deg = args.single_angle
         config.arc_end_deg = args.single_angle
         config.arc_step_deg = 1.0
-        logging.info(f"single-angle mode: capturing at {args.single_angle} deg")
+        log.info(f"single-angle mode: capturing at {args.single_angle} deg")
 
-    # mesh method auto-selection: ball_pivoting works much better than
-    # poisson for single-angle (one-sided) captures, since poisson tries
-    # to close the surface and hallucinates the back. explicit --mesh-method
-    # always overrides this.
-    if args.mesh_method is None:
-        if args.single_angle is not None:
-            config.mesh_method = "ball_pivoting"
-            logging.info("mesh method auto-selected: ball_pivoting (single-angle)")
-        # else leave config.mesh_method at its default / yaml value (poisson)
-
-    # heightmap-to-solid extrusion: default ON for single-angle runs,
-    # OFF for full sweeps. --no-extrude forces it off.
-    config.extrude_to_plate = (
-        args.single_angle is not None and not args.no_extrude
-    )
-
-    # cli overrides apply only if explicitly set, so yaml/defaults stay intact
+    # cli overrides — only applied if explicitly set.
     if args.arc_start is not None:
         config.arc_start_deg = args.arc_start
     if args.arc_end is not None:
@@ -206,20 +207,44 @@ def main():
         config.frames_per_position = args.frames
     if args.filter_black is not None:
         config.filter_black_threshold = args.filter_black
-    if args.voxel_size is not None:
-        config.voxel_size = args.voxel_size
-    if args.poisson_depth is not None:
-        config.poisson_depth = args.poisson_depth
-    if args.mesh_method is not None:
-        config.mesh_method = args.mesh_method
-    if args.alpha is not None:
-        config.alpha_shape_alpha = args.alpha
-    if args.dome_threshold is not None:
-        config.dome_threshold_m = args.dome_threshold
-    if args.plate_z_cut is not None:
-        config.plate_surface_z_cut_m = args.plate_z_cut
     if args.data_dir is not None:
         config.data_dir = args.data_dir
+
+    # tsdf tunables
+    if args.tsdf_voxel is not None:
+        config.tsdf_voxel_size_m = args.tsdf_voxel
+    if args.tsdf_sdf_trunc is not None:
+        config.tsdf_sdf_trunc_m = args.tsdf_sdf_trunc
+    if args.tsdf_depth_trunc is not None:
+        config.tsdf_depth_trunc_m = args.tsdf_depth_trunc
+    if args.clip_z_min is not None:
+        config.clip_z_min_m = args.clip_z_min
+    if args.clip_z_max is not None:
+        config.clip_z_max_m = args.clip_z_max
+
+    # legacy flags: still write through to the (ignored) config fields so
+    # nothing ever breaks, but warn loudly so the user knows they're no-ops.
+    if args.voxel_size is not None:
+        _warn_legacy(log, "--voxel-size", args.voxel_size)
+        config.voxel_size = args.voxel_size
+    if args.poisson_depth is not None:
+        _warn_legacy(log, "--poisson-depth", args.poisson_depth)
+        config.poisson_depth = args.poisson_depth
+    if args.mesh_method is not None:
+        _warn_legacy(log, "--mesh-method", args.mesh_method)
+        config.mesh_method = args.mesh_method
+    if args.alpha is not None:
+        _warn_legacy(log, "--alpha", args.alpha)
+        config.alpha_shape_alpha = args.alpha
+    if args.no_extrude:
+        _warn_legacy(log, "--no-extrude", True)
+        config.extrude_to_plate = False
+    if args.dome_threshold is not None:
+        _warn_legacy(log, "--dome-threshold", args.dome_threshold)
+        config.dome_threshold_m = args.dome_threshold
+    if args.plate_z_cut is not None:
+        _warn_legacy(log, "--plate-z-cut", args.plate_z_cut)
+        config.plate_surface_z_cut_m = args.plate_z_cut
 
     config.use_mock_arc = args.mock
     config.bag_file = args.bag
