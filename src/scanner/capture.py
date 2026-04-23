@@ -341,15 +341,8 @@ class RealSenseCapture:
 
             # spatial + decimation filters only; NO temporal (tsdf handles
             # that at the voxel level across frames).
-            if not hasattr(self, "_tsdf_decimation"):
-                self._tsdf_decimation = rs.decimation_filter()
-                self._tsdf_decimation.set_option(rs.option.filter_magnitude, self.decimation_magnitude)
-                self._tsdf_spatial = rs.spatial_filter()
-                self._tsdf_spatial.set_option(rs.option.filter_magnitude, 2)
-                self._tsdf_spatial.set_option(rs.option.filter_smooth_alpha, 0.5)
-                self._tsdf_spatial.set_option(rs.option.filter_smooth_delta, 20)
-            depth = self._tsdf_decimation.process(depth)
-            depth = self._tsdf_spatial.process(depth)
+            depth = self.decimation.process(depth)
+            depth = self.spatial.process(depth)
 
             depth_array = np.asanyarray(depth.get_data())
             color_array = np.asanyarray(color.get_data())[:, :, ::-1].copy()
