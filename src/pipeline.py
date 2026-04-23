@@ -920,6 +920,15 @@ class ScanPipeline:
                     "tsdf mesh missing. stage_tsdf_integrate must run first."
                 )
             logger.info("mesh already extracted by tsdf; skipping reconstruction")
+            # clean up marching-cubes artifacts so downstream (ocl) is happy
+            n_before = len(self.mesh.triangles)
+            self.mesh.remove_degenerate_triangles()
+            self.mesh.remove_duplicated_vertices()
+            self.mesh.remove_duplicated_triangles()
+            self.mesh.remove_non_manifold_edges()
+            logger.info(
+                f"mesh cleanup: {n_before} -> {len(self.mesh.triangles)} triangles"
+            )
             # jump to post-mesh cleanup (extrude_to_plate etc). for now the
             # rest of the method is the poisson/bpa/alpha path, which we skip
             # entirely for tsdf. post-mesh cleanup happens inline here:
