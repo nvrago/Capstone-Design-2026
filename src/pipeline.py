@@ -1,13 +1,20 @@
 """
-pipeline.py -- scan-to-cnc orchestrator
+scan-to-cnc pipeline, tsdf edition.
 
 stages:
-    1. capture: arc sweep, D405 depth frames transformed to plate frame
-    2. register: ICP merge position clouds + plate cut + dome subtract
-    3. process: downsample + outlier removal + normals
-    4. mesh: poisson reconstruction (or ball_pivoting / alpha_shape)
-    5. toolpath: opencamlib + g-code writer
-    6. execute: stream g-code to grbl (optional)
+    1. capture: arc sweep, d405 depth+color frames, stored both as
+               transformed point clouds (for ui/debug) and as raw
+               frames+poses (for tsdf integration).
+    2. register: no-op. tsdf integrates directly from known poses, so
+                 icp isn't needed. kept as a named method because
+                 server.py calls it.
+    3. process: tsdf integrate all frames -> extract point cloud ->
+                plate-frame box clip -> largest connected cluster.
+                produces both self.processed_cloud and self.mesh
+                (marching cubes extracted from the tsdf volume).
+    4. mesh: wrap extracted mesh for stage 5 + save mesh.stl / mesh.ply.
+    5. toolpath: opencamlib surface dropcutter + g-code writer.
+    6. execute: stream g-code to grbl (optional).
 
 each run is saved to data/runs/<timestamp>/ with intermediate plys.
 previous runs are never overwritten.
@@ -29,10 +36,9 @@ import numpy as np
 import open3d as o3d
 
 from scanner.capture import RealSenseCapture
-from processing.registration import CloudRegistrator
-from processing.dome_subtract import subtract_dome
-from processing.pointcloud import PointCloud
-from processing.mesh import MeshReconstructor
+from processing.tsdf import TSDFIntegrator, TSDFConfig
+from processing.clip import filter_plate_cloud, ClipConfig
+from processing.mesh import Mesh
 from processing.toolpath import ToolpathGenerator, CutterDef, CutterType
 from gcode.writer import GcodeWriter, GcodeConfig
 from cnc.grbl import GrblController
@@ -60,197 +66,6 @@ def _plate_frame_clip(
     return pcd.select_by_index(np.where(mask)[0].tolist())
 
 
-def _plate_surface_cut(
-    pcd: o3d.geometry.PointCloud,
-    z_cut_m: float,
-) -> o3d.geometry.PointCloud:
-    """
-    drop all points at or below z_cut_m (plate surface + noise).
-    captured plate lands at z ~= 0 with a few mm of noise, so a small
-    positive cutoff (e.g. 0.003m) removes it cleanly while keeping
-    everything on the object above.
-
-    this is the primary background-removal filter. dome subtraction
-    runs after it only to catch hemisphere / arc housing geometry
-    that the camera sees at oblique angles.
-    """
-    pts = np.asarray(pcd.points)
-    if len(pts) == 0:
-        return pcd
-    mask = pts[:, 2] > z_cut_m
-    kept = np.where(mask)[0]
-    removed = len(pts) - len(kept)
-    logger.info(
-        f"plate surface cut at z={z_cut_m*1000:.1f}mm: "
-        f"removed {removed} points ({100.0 * removed / len(pts):.1f}%), "
-        f"{len(kept)} remain"
-    )
-    return pcd.select_by_index(kept.tolist())
-
-
-def _plate_surface_cut_adaptive(
-    pcd: o3d.geometry.PointCloud,
-    buffer_m: float,
-    bottom_fraction: float = 0.20,
-) -> o3d.geometry.PointCloud:
-    """
-    adaptive plate removal. fits a plane to the lowest bottom_fraction
-    of points (guaranteed plate since it sits below any real object),
-    then drops everything within buffer_m above the plane.
-
-    adapts to the actual plate height and tilt, so a 1.5mm buffer can
-    hug the plate tightly without caring whether the plate sits at
-    z=2mm or z=5mm on a given run. works at any arc angle, not just
-    overhead, because the plane fit follows the plate rather than
-    assuming a fixed z.
-    """
-    pts = np.asarray(pcd.points)
-    if len(pts) == 0:
-        return pcd
-
-    # take the bottom fraction by z; these are the plate
-    n = len(pts)
-    n_bottom = max(int(n * bottom_fraction), 50)
-    bottom_idx = np.argpartition(pts[:, 2], n_bottom)[:n_bottom]
-    bottom_pts = pts[bottom_idx]
-
-    # least-squares plane fit: z = a*x + b*y + c
-    # gives plane normal [-a, -b, 1] / sqrt(a^2 + b^2 + 1), offset c
-    A = np.column_stack([bottom_pts[:, 0], bottom_pts[:, 1], np.ones(n_bottom)])
-    coeffs, *_ = np.linalg.lstsq(A, bottom_pts[:, 2], rcond=None)
-    a, b, c = coeffs
-    normal = np.array([-a, -b, 1.0])
-    normal /= np.linalg.norm(normal)
-    d = -c / np.sqrt(a * a + b * b + 1.0)
-
-    # signed distance from each point to the plane, positive = above
-    dist = pts @ normal + d
-
-    mask = dist > buffer_m
-    kept = np.where(mask)[0]
-    removed = n - len(kept)
-    logger.info(
-        f"adaptive plate cut: plane tilt={np.degrees(np.arccos(normal[2])):.2f} deg, "
-        f"buffer={buffer_m*1000:.1f}mm, "
-        f"removed {removed} points ({100.0 * removed / n:.1f}%), "
-        f"{len(kept)} remain"
-    )
-    return pcd.select_by_index(kept.tolist())
-
-
-def _object_component_vertices(mesh) -> np.ndarray:
-    """
-    identify the "object" component among all mesh fragments. picks
-    the component with the highest maximum z, since the object is
-    always taller than plate-fragment residuals (which sit near z=0
-    by construction after the plate cut).
-
-    falls back to biggest-by-triangle-count only if something fails.
-    """
-    labels, counts, _ = mesh.mesh.cluster_connected_triangles()
-    labels = np.asarray(labels)
-    counts = np.asarray(counts)
-    if len(counts) == 0:
-        return np.asarray(mesh.mesh.vertices)
-
-    verts = np.asarray(mesh.mesh.vertices)
-    tris = np.asarray(mesh.mesh.triangles)
-
-    # compute max z per component
-    max_z_per_component = np.full(len(counts), -np.inf)
-    for comp_idx in range(len(counts)):
-        tri_mask = labels == comp_idx
-        if not tri_mask.any():
-            continue
-        comp_tris = tris[tri_mask]
-        comp_vert_idx = np.unique(comp_tris.ravel())
-        comp_max_z = verts[comp_vert_idx, 2].max()
-        max_z_per_component[comp_idx] = comp_max_z
-
-    best = int(np.argmax(max_z_per_component))
-    logger.info(
-        f"object component: #{best} of {len(counts)} "
-        f"(max_z={max_z_per_component[best]*1000:.1f}mm, "
-        f"{counts[best]} triangles)"
-    )
-
-    tri_mask = labels == best
-    comp_tris = tris[tri_mask]
-    comp_vert_idx = np.unique(comp_tris.ravel())
-    return verts[comp_vert_idx]
-
-def _xy_hull_with_margin(points: np.ndarray, margin_m: float) -> np.ndarray:
-    """
-    compute convex hull of the points' XY projection, then inflate
-    outward by margin_m. returns an Nx2 array of hull vertices in CCW
-    order (the inflated polygon). safe on small/degenerate inputs.
-    """
-    from scipy.spatial import ConvexHull
-    xy = points[:, :2]
-    if len(xy) < 3:
-        mn = xy.min(axis=0) - margin_m
-        mx = xy.max(axis=0) + margin_m
-        return np.array([
-            [mn[0], mn[1]],
-            [mx[0], mn[1]],
-            [mx[0], mx[1]],
-            [mn[0], mx[1]],
-        ])
-    try:
-        hull = ConvexHull(xy)
-    except Exception:
-        # scipy complains on collinear or duplicate points; fall back to bbox
-        mn = xy.min(axis=0) - margin_m
-        mx = xy.max(axis=0) + margin_m
-        return np.array([
-            [mn[0], mn[1]],
-            [mx[0], mn[1]],
-            [mx[0], mx[1]],
-            [mn[0], mx[1]],
-        ])
-    hull_pts = xy[hull.vertices]
-    # inflate outward: push each hull vertex away from the centroid
-    centroid = hull_pts.mean(axis=0)
-    directions = hull_pts - centroid
-    norms = np.linalg.norm(directions, axis=1, keepdims=True)
-    norms[norms < 1e-9] = 1.0
-    inflated = hull_pts + directions / norms * margin_m
-    return inflated
-
-
-def _clip_cloud_to_xy_polygon(
-    pcd: o3d.geometry.PointCloud,
-    polygon_xy: np.ndarray,
-) -> o3d.geometry.PointCloud:
-    """
-    drop points whose (x, y) falls outside polygon_xy. ray-casting
-    point-in-polygon test. polygon is assumed closed (last vertex
-    connects back to the first).
-    """
-    pts = np.asarray(pcd.points)
-    if len(pts) == 0:
-        return pcd
-    xy = pts[:, :2]
-    inside = np.zeros(len(xy), dtype=bool)
-    n = len(polygon_xy)
-    j = n - 1
-    for i in range(n):
-        xi, yi = polygon_xy[i]
-        xj, yj = polygon_xy[j]
-        cond = ((yi > xy[:, 1]) != (yj > xy[:, 1])) & (
-            xy[:, 0] < (xj - xi) * (xy[:, 1] - yi) / (yj - yi + 1e-12) + xi
-        )
-        inside ^= cond
-        j = i
-    kept = np.where(inside)[0]
-    removed = len(pts) - len(kept)
-    logger.info(
-        f"hull clip: removed {removed} points outside object footprint "
-        f"({100.0 * removed / len(pts):.1f}%), {len(kept)} remain"
-    )
-    return pcd.select_by_index(kept.tolist())
-
-
 @dataclass
 class PipelineConfig:
     """all tunable parameters. loaded from yaml via from_yaml()."""
@@ -266,7 +81,6 @@ class PipelineConfig:
 
     # arc geometry (plate frame, from onshape dome)
     # origin at plate-top center, +Z up, arc sweeps XZ plane.
-    # verified calibration: plate frame centroid = -0.002m at 90 deg.
     arc_radius_m: float = 0.255
     arc_center_z_m: float = 0.000
 
@@ -277,74 +91,54 @@ class PipelineConfig:
     frames_per_position: int = 30
     decimation_magnitude: int = 2
 
-    # plate-frame box clip (outermost envelope filter).
-    # sized to match plate footprint and CNC work envelope (both ~30cm),
-    # with 15cm max object height.
-    plate_xy_extent_m: float = 0.060
-    plate_z_min_m: float = 0.002
-    plate_z_max_m: float = 0.060
+    # plate-frame box clip (stage 1, pre-tsdf envelope).
+    # kept loose here; tight filtering happens again in stage 3.
+    plate_xy_extent_m: float = 0.150
+    plate_z_min_m: float = -0.010
+    plate_z_max_m: float = 0.150
 
-    # plate-surface z cut (primary background removal).
-    # captured plate lands at z ~= 0 with ~3mm noise, so cutting at 3mm
-    # drops it cleanly while keeping object points above.
+    # tsdf integration (stage 3 core).
+    # voxel 1mm matches d405 sub-mm accuracy; sdf_trunc ~4 voxels of
+    # carving distance; depth_trunc matches d405 ideal range (50cm).
+    tsdf_voxel_size_m: float = 0.001
+    tsdf_sdf_trunc_m: float = 0.004
+    tsdf_depth_trunc_m: float = 0.5
+    # depth_scale: meters-per-raw-unit divisor. d405 default is 0.0001,
+    # so depth_scale = 10000. overridden at runtime by what the scanner
+    # reports, but kept as a config fallback.
+    tsdf_depth_scale: float = 10000.0
+
+    # final plate-frame clip + cluster (stage 3 post-tsdf).
+    # tighter than stage-1 clip; kills plate surface, arc hardware,
+    # and stragglers. sized to plate footprint and ~10cm object height.
+    clip_xy_extent_m: float = 0.100
+    clip_z_min_m: float = 0.002
+    clip_z_max_m: float = 0.100
+    cluster_eps_m: float = 0.005
+    cluster_min_points: int = 50
+
+    # legacy fields kept for config compatibility. from_yaml loads these
+    # if present but the tsdf pipeline ignores them. removing them would
+    # break server.py / UI configs that still reference old yaml keys.
     plate_surface_z_cut_m: float = 0.003
-
-    # adaptive plate cut (replaces the static z_cut above when enabled).
-    # fits a plane to the lowest 20% of points and cuts within this
-    # distance above the plane. tighter than the static cut because
-    # it adapts to actual plate height/tilt rather than assuming z~=0.
-    # 2.5mm preserves sub-5mm object features while hugging the plate.
     plate_surface_buffer_m: float = 0.0025
     use_adaptive_plate_cut: bool = True
-
-    # object-footprint hull clip (stage 4 cleanup).
-    # after the first mesh pass, finds the largest connected component,
-    # takes its XY convex hull (with small margin), clips the processed
-    # cloud to that footprint, then re-meshes. eliminates plate-fragment
-    # residuals cleanly without touching the object.
-    use_hull_clip: bool = True
-    hull_margin_m: float = 0.003  # 3mm outward inflation, preserves edges
-
-    # dome subtraction (secondary, for hemisphere / arc housing).
-    # threshold is loose (50mm) so it only catches obvious hemisphere
-    # geometry seen at oblique arc angles. at overhead (90 deg) this
-    # removes essentially nothing, which is correct - plate cut
-    # already did the work. at 0 or 180 deg, dome subtract removes
-    # the arc-housing points the camera sees at grazing angles.
+    use_hull_clip: bool = False
+    hull_margin_m: float = 0.003
     dome_reference_path: str = "data/reference/dome_cloud.ply"
     dome_threshold_m: float = 0.008
-
-    # icp registration (clouds already in plate frame, so initial is identity)
     icp_voxel_size: float = 0.005
     icp_max_distance: float = 0.05
-
-    # processing. tuned for post-subtraction clouds of a few thousand points.
-    # voxel 2mm preserves mm-scale detail; nb_neighbors 20 avoids over-culling
-    # small clouds; std_ratio 2.0 keeps object edges.
     voxel_size: float = 0.002
     outlier_nb_neighbors: int = 20
     outlier_std_ratio: float = 2.0
     normal_radius: float = 0.02
-
-    # mesh
-    mesh_method: str = "poisson"
+    mesh_method: str = "tsdf"
     poisson_depth: int = 7
     poisson_scale: float = 1.1
-    # alpha shape reconstruction (better for open surfaces / single-angle captures).
-    # smaller alpha = tighter fit. 0.01 = 10mm, tune per object scale.
     alpha_shape_alpha: float = 0.010
-    # ball pivoting reconstruction (good for uniformly-dense clouds).
-    # radii in meters; smallest should be ~voxel_size, largest ~3-4x.
     ball_pivoting_radii: list = field(default_factory=lambda: [0.003, 0.006, 0.012])
-    # single-angle mode: extrude the heightmap mesh into a watertight
-    # solid so OCL gets a closed surface for dropcutter. set True when
-    # only the top is scanned (one arc angle); leave False for full sweeps.
     extrude_to_plate: bool = False
-
-    # capture-time color filtering.
-    # drop near-black pixels (e.g. matte black cloth background). per-channel:
-    # a point is removed only if r, g, b are all below this value (0-255).
-    # None disables the filter entirely.
     filter_black_threshold: int = None
 
     # toolpath
@@ -375,7 +169,7 @@ class PipelineConfig:
     @classmethod
     def from_yaml(cls, config_dir: str = "config") -> "PipelineConfig":
         """load config from scanner.yaml + processing.yaml + machine.yaml.
-        cli args override yaml values where applicable."""
+        legacy keys are still read for compat; unknown keys are ignored."""
         config_dir = Path(config_dir)
         overrides = {}
 
@@ -391,6 +185,7 @@ class PipelineConfig:
                 "plate.xy_extent_m": "plate_xy_extent_m",
                 "plate.z_min_m": "plate_z_min_m",
                 "plate.z_max_m": "plate_z_max_m",
+                # legacy scanner keys, ignored by tsdf path but still parsed
                 "plate.surface_z_cut_m": "plate_surface_z_cut_m",
                 "plate.surface_buffer_m": "plate_surface_buffer_m",
                 "plate.use_adaptive_cut": "use_adaptive_plate_cut",
@@ -398,6 +193,27 @@ class PipelineConfig:
                 "dome.threshold_m": "dome_threshold_m",
             },
             "processing": {
+                # tsdf block (new)
+                "tsdf.voxel_size_m": "tsdf_voxel_size_m",
+                "tsdf.sdf_trunc_m": "tsdf_sdf_trunc_m",
+                "tsdf.depth_trunc_m": "tsdf_depth_trunc_m",
+                "tsdf.depth_scale": "tsdf_depth_scale",
+                # clip block (new)
+                "clip.xy_extent_m": "clip_xy_extent_m",
+                "clip.z_min_m": "clip_z_min_m",
+                "clip.z_max_m": "clip_z_max_m",
+                "clip.cluster_eps_m": "cluster_eps_m",
+                "clip.cluster_min_points": "cluster_min_points",
+                # toolpath / gcode (unchanged)
+                "toolpath.cutter.diameter": "cutter_diameter",
+                "toolpath.cutter.length": "cutter_length",
+                "toolpath.surface.stepover": "stepover",
+                "toolpath.surface.direction": "surface_direction",
+                "toolpath.clearance_height": "clearance_height",
+                "gcode.feed_rate": "feed_rate",
+                "gcode.plunge_rate": "plunge_rate",
+                "gcode.spindle_speed": "spindle_speed",
+                # legacy processing keys, ignored by tsdf path
                 "pointcloud.voxel_size": "voxel_size",
                 "pointcloud.outlier_removal.nb_neighbors": "outlier_nb_neighbors",
                 "pointcloud.outlier_removal.std_ratio": "outlier_std_ratio",
@@ -409,14 +225,6 @@ class PipelineConfig:
                 "mesh.ball_pivoting.radii": "ball_pivoting_radii",
                 "mesh.hull_clip": "use_hull_clip",
                 "mesh.hull_margin_m": "hull_margin_m",
-                "toolpath.cutter.diameter": "cutter_diameter",
-                "toolpath.cutter.length": "cutter_length",
-                "toolpath.surface.stepover": "stepover",
-                "toolpath.surface.direction": "surface_direction",
-                "toolpath.clearance_height": "clearance_height",
-                "gcode.feed_rate": "feed_rate",
-                "gcode.plunge_rate": "plunge_rate",
-                "gcode.spindle_speed": "spindle_speed",
                 "icp.voxel_size": "icp_voxel_size",
                 "icp.max_distance": "icp_max_distance",
             },
@@ -464,8 +272,13 @@ class ScanPipeline:
         self.scanner = None
         self.run_dir: Path = None
 
-        # state carried between stages
-        self.position_clouds: list[tuple[float, o3d.geometry.PointCloud]] = []
+        # state carried between stages.
+        # position_clouds: list[(angle_deg, o3d.PointCloud)] — transformed
+        #                  point clouds, for ui display and debug saves.
+        # position_frames: list[dict] — raw depth/color/pose/intrinsics,
+        #                  for tsdf integration in stage 3.
+        self.position_clouds: list = []
+        self.position_frames: list = []
         self.combined_cloud: o3d.geometry.PointCloud = None
         self.processed_cloud: o3d.geometry.PointCloud = None
         self.mesh = None
@@ -492,7 +305,7 @@ class ScanPipeline:
             o3d.io.write_point_cloud(str(path), obj)
         elif isinstance(obj, o3d.geometry.TriangleMesh):
             o3d.io.write_triangle_mesh(str(path), obj)
-        elif hasattr(obj, 'save'):
+        elif hasattr(obj, "save"):
             obj.save(str(path))
         else:
             with open(path, "w") as f:
@@ -553,12 +366,14 @@ class ScanPipeline:
     # stage 1: capture
 
     def stage_1_capture(self):
-        """arc sweep, capture depth at each position, transform to plate frame."""
+        """arc sweep. at each position, capture both a transformed point
+        cloud (for debug / ui) and raw frames+pose (for tsdf integration)."""
         logger.info("=== stage 1: capture ===")
         start = time.time()
 
         self.arc.home()
         self.position_clouds.clear()
+        self.position_frames.clear()
 
         positions = np.arange(
             self.config.arc_start_deg,
@@ -576,209 +391,133 @@ class ScanPipeline:
             self.arc.move_to_steps(self._angle_to_steps(angle))
             time.sleep(0.3)
 
-            pcd = self.scanner.capture(angle_deg=float(angle))
-
-            if pcd is None or len(pcd.points) == 0:
-                logger.warning(f"empty capture at {angle:.1f} deg, skipping")
+            # raw frames for tsdf. does the temporal-average capture once
+            # internally, so this is the full "measurement" for the angle.
+            try:
+                frame = self.scanner.capture_frames(angle_deg=float(angle))
+            except Exception as e:
+                logger.warning(f"capture_frames failed at {angle:.1f} deg: {e}")
                 continue
 
-            before = len(pcd.points)
-            pcd = self._clip(pcd)
-            logger.info(f"clip: {len(pcd.points)}/{before} points kept")
+            self.position_frames.append({"angle_deg": float(angle), **frame})
 
-            if len(pcd.points) == 0:
-                logger.warning(f"clip removed all points at {angle:.1f} deg")
-                continue
+            # transformed point cloud for debug / ui. cheap to derive
+            # separately via scanner.capture() since it reuses the filter
+            # chain; we could reproject from the frame dict instead but
+            # keeping the existing call path preserves the ply-saving
+            # behaviour server.py/UI expects.
+            try:
+                pcd = self.scanner.capture(angle_deg=float(angle))
+            except Exception as e:
+                logger.warning(f"capture (pcd) failed at {angle:.1f} deg: {e}")
+                pcd = None
 
-            self._save(pcd, f"position_clouds/pos_{angle:.1f}.ply")
-            self.position_clouds.append((float(angle), pcd))
+            if pcd is not None and len(pcd.points) > 0:
+                before = len(pcd.points)
+                pcd = self._clip(pcd)
+                logger.info(f"clip: {len(pcd.points)}/{before} points kept")
+                if len(pcd.points) > 0:
+                    self._save(pcd, f"position_clouds/pos_{angle:.1f}.ply")
+                    self.position_clouds.append((float(angle), pcd))
 
-        logger.info(f"stage 1 complete: {len(self.position_clouds)} positions "
-                    f"in {time.time() - start:.1f}s")
+        logger.info(f"stage 1 complete: {len(self.position_frames)} frames, "
+                    f"{len(self.position_clouds)} clouds in "
+                    f"{time.time() - start:.1f}s")
 
-    # stage 2: register + background removal
+    # stage 2: register (no-op in tsdf pipeline)
 
     def stage_2_register(self):
-        """icp merge position clouds, plate surface z-cut, then dome subtract."""
-        logger.info("=== stage 2: register + background removal ===")
-        start = time.time()
+        """no-op. tsdf integrates directly from known arc poses, so icp
+        registration is unnecessary. kept so server.py's UI button path
+        doesn't AttributeError."""
+        logger.info("=== stage 2: register ===")
+        logger.info("stage 2 (register): no-op in tsdf pipeline "
+                    "(poses are known from arc geometry)")
 
-        if not self.position_clouds:
-            raise RuntimeError("no position clouds, run stage 1 first")
-
-        registrator = CloudRegistrator(
-            voxel_size=self.config.icp_voxel_size,
-            icp_max_distance=self.config.icp_max_distance,
-        )
-        for angle, cloud in self.position_clouds:
-            registrator.add_cloud(cloud, angle)
-
-        self.combined_cloud = registrator.register_all()
-        self._save(self.combined_cloud, "raw_combined.ply")
-        logger.info(f"after icp: {len(self.combined_cloud.points)} points")
-
-        # plate surface cut: primary background removal.
-        # adaptive mode fits a plane and cuts within buffer_m above it;
-        # static mode cuts at a fixed z. adaptive is the default because
-        # it hugs the plate tighter without risking object bases.
-        if self.config.use_adaptive_plate_cut:
-            self.combined_cloud = _plate_surface_cut_adaptive(
-                self.combined_cloud,
-                buffer_m=self.config.plate_surface_buffer_m,
-            )
-        else:
-            self.combined_cloud = _plate_surface_cut(
-                self.combined_cloud,
-                z_cut_m=self.config.plate_surface_z_cut_m,
-            )
-        self._save(self.combined_cloud, "after_plate_cut.ply")
-
-        # dome subtraction: secondary, removes hemisphere / arc housing
-        # points visible at oblique arc angles. loose threshold so it
-        # doesn't eat object points near (but above) the plate.
-        self.combined_cloud = subtract_dome(
-            self.combined_cloud,
-            threshold_m=self.config.dome_threshold_m,
-            dome_path=Path(self.config.dome_reference_path),
-        )
-        self._save(self.combined_cloud, "after_dome.ply")
-        logger.info(f"after dome subtract: {len(self.combined_cloud.points)} points")
-
-        logger.info(f"stage 2 complete in {time.time() - start:.1f}s")
-
-    # stage 3: process
+    # stage 3: tsdf integrate + clip + cluster
 
     def stage_3_process(self):
-        """downsample + outlier removal + normals."""
-        logger.info("=== stage 3: process ===")
+        """tsdf integrate all captured frames with known poses, then
+        plate-frame box clip and largest-cluster filter. also extracts
+        the marching-cubes mesh since the tsdf volume is right here."""
+        logger.info("=== stage 3: process (tsdf) ===")
         start = time.time()
 
-        if self.combined_cloud is None:
-            raise RuntimeError("no combined cloud, run stage 2 first")
+        if not self.position_frames:
+            raise RuntimeError("no captured frames, run stage 1 first")
 
-        if len(self.combined_cloud.points) == 0:
-            raise RuntimeError(
-            "combined cloud is empty. check stage 2 background removal - "
-            "the plate cut and dome subtract may be too aggressive."
+        # use the intrinsics from the first frame. all frames share the
+        # same camera, so intrinsics are constant.
+        intr = self.position_frames[0]["intrinsics"]
+
+        tsdf_cfg = TSDFConfig(
+            voxel_size_m=self.config.tsdf_voxel_size_m,
+            sdf_trunc_m=self.config.tsdf_sdf_trunc_m,
+            depth_trunc_m=self.config.tsdf_depth_trunc_m,
+            depth_scale=self.config.tsdf_depth_scale,
+            use_color=True,
         )
-        pcd = PointCloud(np.asarray(self.combined_cloud.points))
-        if self.combined_cloud.has_colors():
-            pcd.pcd.colors = self.combined_cloud.colors
+        # if scanner reported a real depth_scale, prefer that over config.
+        # d405 default is 0.0001 -> divisor 10000; scanner returns the
+        # raw scale (meters/unit), so flip it.
+        reported = self.position_frames[0].get("depth_scale_m")
+        if reported and reported > 0:
+            tsdf_cfg.depth_scale = 1.0 / float(reported)
+            logger.info(f"using reported depth_scale divisor: {tsdf_cfg.depth_scale}")
 
-        pcd = pcd.downsample_voxel(self.config.voxel_size)
-        logger.info(f"voxel downsample: {len(pcd)} points")
+        integrator = TSDFIntegrator(intrinsics=intr, cfg=tsdf_cfg)
 
-        pcd = pcd.remove_outliers_statistical(
-            nb_neighbors=self.config.outlier_nb_neighbors,
-            std_ratio=self.config.outlier_std_ratio,
+        for f in self.position_frames:
+            integrator.integrate(
+                depth=f["depth"],
+                color=f["color"],
+                plate_T_camera=f["pose"],
+            )
+
+        # fused point cloud + marching-cubes mesh straight from the volume
+        fused = integrator.extract_point_cloud()
+        self._save(fused, "tsdf_fused.ply")
+        logger.info(f"tsdf fused cloud: {len(fused.points)} points")
+
+        raw_mesh = integrator.extract_mesh()
+        self._save(raw_mesh, "tsdf_raw.ply")
+
+        # final filtering: box clip in plate frame + largest cluster.
+        clip_cfg = ClipConfig(
+            xy_extent_m=self.config.clip_xy_extent_m,
+            z_min_m=self.config.clip_z_min_m,
+            z_max_m=self.config.clip_z_max_m,
+            cluster_eps_m=self.config.cluster_eps_m,
+            cluster_min_points=self.config.cluster_min_points,
         )
-        logger.info(f"outlier removal: {len(pcd)} points")
+        self.processed_cloud = filter_plate_cloud(fused, clip_cfg)
+        self._save(self.processed_cloud, "processed.ply")
 
-        pcd.estimate_normals(radius=self.config.normal_radius)
-        self._save(pcd, "processed.ply")
-        self.processed_cloud = pcd
+        # also keep the raw fused cloud accessible for debug
+        self.combined_cloud = fused
 
-        logger.info(f"stage 3 complete: {len(pcd)} points in {time.time() - start:.1f}s")
+        # stash the raw o3d mesh; stage 4 wraps it in the Mesh class
+        self._raw_mesh = raw_mesh
 
-    # stage 4: mesh
+        logger.info(f"stage 3 complete: {len(self.processed_cloud.points)} points "
+                    f"in {time.time() - start:.1f}s")
+
+    # stage 4: mesh (wrap tsdf output for stage 5)
 
     def stage_4_mesh(self):
-        """surface reconstruction. method selectable via config.mesh_method.
-        with use_hull_clip, does two passes: first mesh finds the object
-        footprint, second mesh runs on the XY-clipped cloud to remove
-        plate-fragment residuals."""
+        """wrap the tsdf-extracted mesh in the Mesh class that stage 5
+        expects, remove degenerate triangles, save mesh.stl / mesh.ply."""
         logger.info("=== stage 4: mesh ===")
         start = time.time()
 
-        if self.processed_cloud is None:
-            raise RuntimeError("no processed cloud, run stage 3 first")
+        if getattr(self, "_raw_mesh", None) is None:
+            raise RuntimeError("no tsdf mesh, run stage 3 first")
 
-        reconstructor = MeshReconstructor()
-
-        method = self.config.mesh_method
-        if method == "poisson":
-            kwargs = {
-                "depth": self.config.poisson_depth,
-                "scale": self.config.poisson_scale,
-            }
-        elif method == "alpha_shape":
-            kwargs = {"alpha": self.config.alpha_shape_alpha}
-        elif method == "ball_pivoting":
-            kwargs = {"radii": self.config.ball_pivoting_radii}
-        else:
-            raise ValueError(
-                f"unknown mesh_method '{method}'. "
-                f"use 'poisson', 'alpha_shape', or 'ball_pivoting'."
-            )
-
-        logger.info(f"mesh method: {method} with {kwargs}")
-
-        # first pass: mesh the processed cloud to find the object footprint
-        mesh = reconstructor.reconstruct(
-            self.processed_cloud,
-            method=method,
-            **kwargs,
-        )
+        # Mesh wrapper provides .remove_degenerate / .compute_normals /
+        # .get_bounds / .triangle_count / .mesh — all methods stage 5
+        # and the toolpath generator use.
+        mesh = Mesh(self._raw_mesh)
         mesh.remove_degenerate()
-
-        # split pinch-point (non-manifold) vertices so separate surface
-        # patches become separate components. no-op on already-manifold
-        # output (poisson). for ball_pivoting / alpha_shape, this turns
-        # false single-component meshes into the real multi-component
-        # topology, which lets remove_small_components actually do its job.
-        mesh.split_non_manifold_vertices()
-
-        mesh.remove_small_components()
-
-        # hull clip: find largest component, take XY convex hull with margin,
-        # drop any processed-cloud point outside that footprint, re-mesh.
-        # this kills plate-fragment residuals that slipped past the adaptive
-        # plate cut without risking the object itself.
-        if self.config.use_hull_clip:
-            logger.info("hull clip: extracting object footprint from first-pass mesh")
-            obj_verts = _object_component_vertices(mesh)
-            hull_poly = _xy_hull_with_margin(
-                obj_verts,
-                margin_m=self.config.hull_margin_m,
-            )
-            logger.info(
-                f"hull clip: {len(hull_poly)} hull vertices, "
-                f"margin={self.config.hull_margin_m*1000:.1f}mm"
-            )
-
-            clipped = _clip_cloud_to_xy_polygon(
-                self.processed_cloud.pcd,
-                hull_poly,
-            )
-            self._save(clipped, "after_hull_clip.ply")
-
-            # rebuild a PointCloud wrapper so reconstructor can use it
-            clipped_pc = PointCloud(np.asarray(clipped.points))
-            if clipped.has_colors():
-                clipped_pc.pcd.colors = clipped.colors
-            if clipped.has_normals():
-                clipped_pc.pcd.normals = clipped.normals
-            else:
-                clipped_pc.estimate_normals(radius=self.config.normal_radius)
-
-            # second mesh pass on the clipped cloud
-            mesh = reconstructor.reconstruct(
-                clipped_pc,
-                method=method,
-                **kwargs,
-            )
-            mesh.remove_degenerate()
-            mesh.split_non_manifold_vertices()
-            mesh.remove_small_components()
-            logger.info(f"hull clip: re-meshed, {mesh.triangle_count} triangles")
-
-        # close single-angle heightmap into a watertight solid so OCL's
-        # dropcutter gets a proper closed surface to sample. runs after
-        # the cleanup above so the boundary is one clean loop.
-        if self.config.extrude_to_plate:
-            logger.info("extruding heightmap to plate (single-angle mode)")
-            mesh.extrude_to_plate(plate_z=0.0)
-
         mesh.compute_normals()
 
         self._save(mesh, "mesh.stl")
@@ -831,7 +570,8 @@ class ScanPipeline:
         writer.save(str(self.gcode_path))
 
         logger.info(f"stage 5 complete: {len(writer.lines)} lines, "
-                    f"est. {writer.estimate_time():.1f} min in {time.time() - start:.1f}s")
+                    f"est. {writer.estimate_time():.1f} min in "
+                    f"{time.time() - start:.1f}s")
 
     # stage 6: cnc execution
 
@@ -877,6 +617,47 @@ class ScanPipeline:
 
         logger.info(f"stage 6 complete in {time.time() - start:.1f}s")
 
+    # server.py compat stubs (no-ops, tsdf pipeline doesn't need them)
+
+    def capture_zero_reference(self):
+        """no-op. the tsdf box clip replaces zero-reference subtraction."""
+        logger.info("capture_zero_reference: no-op in tsdf pipeline "
+                    "(box clip handles background)")
+
+    def capture_frame(self, angle_deg: float, **kwargs):
+        """interactive single-frame capture (used by ui). delegates to
+        stage_1_capture's per-angle logic for a single angle."""
+        if self.scanner is None:
+            raise RuntimeError("scanner not started; call setup() first")
+        if self.arc is None:
+            raise RuntimeError("arc not connected; call setup() first")
+
+        logger.info(f"interactive capture at {angle_deg:.1f} deg")
+        self.arc.move_to_steps(self._angle_to_steps(angle_deg))
+        time.sleep(0.3)
+
+        frame = self.scanner.capture_frames(angle_deg=float(angle_deg))
+        self.position_frames.append({"angle_deg": float(angle_deg), **frame})
+
+        pcd = self.scanner.capture(angle_deg=float(angle_deg))
+        if pcd is not None and len(pcd.points) > 0:
+            pcd = self._clip(pcd)
+            if len(pcd.points) > 0:
+                if self.run_dir is None:
+                    self._create_run_dir()
+                self._save(pcd, f"position_clouds/pos_{angle_deg:.1f}.ply")
+                self.position_clouds.append((float(angle_deg), pcd))
+
+        return {
+            "angle_deg": float(angle_deg),
+            "n_points": 0 if pcd is None else len(pcd.points),
+        }
+
+    def end_interactive_capture(self):
+        """no-op. setup()/teardown() manage the scanner lifecycle."""
+        logger.info("end_interactive_capture: no-op "
+                    "(teardown handles scanner cleanup)")
+
     # full run
 
     def run(
@@ -885,6 +666,7 @@ class ScanPipeline:
         end_stage: int = 6,
         dry_run: bool = False,
         skip_execute: bool = False,
+        run_dir: str = None,   # accepted for server.py compat, ignored
     ):
         if skip_execute and end_stage > 5:
             end_stage = 5
@@ -917,7 +699,8 @@ class ScanPipeline:
                 name, func = stages[stage_num]
                 t0 = time.time()
                 func()
-                logger.info(f"stage {stage_num} ({name}): {time.time() - t0:.1f}s")
+                logger.info(f"stage {stage_num} ({name}): "
+                            f"{time.time() - t0:.1f}s")
 
         except KeyboardInterrupt:
             logger.warning("pipeline interrupted")
