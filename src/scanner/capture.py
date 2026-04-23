@@ -1,8 +1,10 @@
 """
 stage 1: depth capture via intel realsense d405
+
 captures depth + color frames, applies temporal averaging,
 transforms into plate (world) frame using arc geometry,
 and outputs a ply point cloud for stage 2 (open3d processing).
+
 no gui, fully automated, headless-compatible.
 """
 
@@ -113,6 +115,11 @@ class RealSenseCapture:
         self.align = None
         self.profile = None
 
+        # populated in start() once the pipeline is running. cached so
+        # capture_frames() doesn't have to re-query every call.
+        self.depth_scale = None        # meters per raw depth unit (d405 default 0.0001)
+        self.intrinsics = None         # o3d.camera.PinholeCameraIntrinsic of filtered depth
+
     def _configure_streams(self):
         """enable depth and color streams, or load from .bag file."""
         if self.bag_file:
@@ -178,6 +185,9 @@ class RealSenseCapture:
             playback = self.profile.get_device().as_playback()
             playback.set_real_time(False)
             logger.info("playback mode: real-time disabled, processing at full speed")
+            # bag files don't expose a depth sensor the same way - fall back
+            # to the d405 default depth scale for tsdf.
+            self.depth_scale = 0.0001
         else:
             device = self.profile.get_device()
             depth_sensor = device.first_depth_sensor()
@@ -186,8 +196,8 @@ class RealSenseCapture:
                 depth_sensor.set_option(rs.option.visual_preset, 3)
                 logger.info("set depth sensor to high accuracy preset")
 
-            depth_scale = depth_sensor.get_depth_scale()
-            logger.info(f"depth scale: {depth_scale} (meters per unit)")
+            self.depth_scale = depth_sensor.get_depth_scale()
+            logger.info(f"depth scale: {self.depth_scale} (meters per unit)")
 
         self.align = rs.align(rs.stream.depth)
 
@@ -195,6 +205,30 @@ class RealSenseCapture:
             logger.info("warming up sensor (30 frames)...")
             for _ in range(30):
                 self.pipeline.wait_for_frames()
+
+        # cache intrinsics from a warmup frame AFTER the filter chain so
+        # they match the decimated resolution tsdf will actually see.
+        # decimation magnitude=2 takes 640x480 -> 320x240.
+        try:
+            frameset = self.pipeline.wait_for_frames()
+            aligned = self.align.process(frameset)
+            depth = aligned.get_depth_frame()
+            filtered = self._apply_filters(depth)
+            prof = filtered.get_profile().as_video_stream_profile()
+            intr = prof.get_intrinsics()
+            self.intrinsics = o3d.camera.PinholeCameraIntrinsic(
+                width=intr.width, height=intr.height,
+                fx=intr.fx, fy=intr.fy,
+                cx=intr.ppx, cy=intr.ppy,
+            )
+            logger.info(
+                f"cached intrinsics: {intr.width}x{intr.height} "
+                f"fx={intr.fx:.2f} fy={intr.fy:.2f} "
+                f"cx={intr.ppx:.2f} cy={intr.ppy:.2f}"
+            )
+        except Exception as e:
+            logger.warning(f"could not cache intrinsics at start: {e}")
+            self.intrinsics = None
 
         logger.info("realsense pipeline ready")
 
@@ -329,6 +363,85 @@ class RealSenseCapture:
             logger.info(f"saved point cloud to {output_path}")
 
         return pcd
+
+    def capture_frames(self, angle_deg: float):
+        """
+        capture averaged raw frames + pose + intrinsics for tsdf integration.
+
+        returns a dict with keys:
+          depth:          uint16 HxW numpy array of filtered depth (raw units)
+          color:          uint8 HxWx3 rgb numpy array, aligned to depth
+          pose:           4x4 float64 plate_T_camera (camera frame in plate frame)
+          intrinsics:     o3d.camera.PinholeCameraIntrinsic matching the depth size
+          depth_scale_m:  float, meters per raw depth unit (d405 default 0.0001)
+
+        unlike capture(), this returns the pre-projected depth+color images
+        so the caller can hand them directly to o3d's tsdf integrator.
+        """
+        depth_frame, color_frame = self.capture_averaged_frames()
+
+        # .copy() is non-negotiable. realsense recycles the underlying frame
+        # buffer across wait_for_frames() calls; without .copy(), every
+        # captured frame ends up being the LAST one. previously cost us hours
+        # of debugging multi-angle scans.
+        depth = np.asanyarray(depth_frame.get_data()).copy()
+
+        # color is the un-decimated aligned frame (self.width x self.height).
+        # depth after decimation is smaller. re-sample color to match depth
+        # so tsdf's create_from_color_and_depth gets matching shapes.
+        color_raw = np.asanyarray(color_frame.get_data()).copy()          # bgr HxWx3
+        h_d, w_d = depth.shape
+        h_c, w_c = color_raw.shape[:2]
+        if (h_c, w_c) != (h_d, w_d):
+            # nearest-neighbor resample so color pixels line up with decimated
+            # depth pixels. avoids introducing a cv2 dep.
+            ys = (np.linspace(0, h_c - 1, h_d)).astype(np.int32)
+            xs = (np.linspace(0, w_c - 1, w_d)).astype(np.int32)
+            color_bgr = color_raw[ys[:, None], xs[None, :]]
+        else:
+            color_bgr = color_raw
+        color = np.ascontiguousarray(color_bgr[..., ::-1])                # bgr -> rgb
+
+        # intrinsics: prefer the cached value (captured in start() from the
+        # filtered frame's profile). fall back to querying live if missing.
+        intrinsics = self.intrinsics
+        if intrinsics is None:
+            prof = depth_frame.get_profile().as_video_stream_profile()
+            intr = prof.get_intrinsics()
+            intrinsics = o3d.camera.PinholeCameraIntrinsic(
+                width=intr.width, height=intr.height,
+                fx=intr.fx, fy=intr.fy,
+                cx=intr.ppx, cy=intr.ppy,
+            )
+
+        # sanity: intrinsics width/height should match depth shape after filters.
+        if (intrinsics.width, intrinsics.height) != (w_d, h_d):
+            logger.warning(
+                f"intrinsics size ({intrinsics.width}x{intrinsics.height}) "
+                f"!= depth size ({w_d}x{h_d}); tsdf projection may be off"
+            )
+
+        pose = camera_to_plate(
+            angle_deg=float(angle_deg),
+            arc_radius_m=self.arc_radius_m,
+            arc_center_z_m=self.arc_center_z_m,
+        )
+
+        depth_scale_m = float(self.depth_scale) if self.depth_scale else 0.0001
+
+        logger.info(
+            f"capture_frames at {angle_deg:.1f} deg: "
+            f"depth {depth.shape} dtype={depth.dtype}, "
+            f"color {color.shape}, depth_scale={depth_scale_m}"
+        )
+
+        return {
+            "depth": depth,
+            "color": color,
+            "pose": pose,
+            "intrinsics": intrinsics,
+            "depth_scale_m": depth_scale_m,
+        }
 
     def stop(self):
         """shut down the pipeline."""
