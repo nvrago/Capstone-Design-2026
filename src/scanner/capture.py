@@ -53,21 +53,14 @@ def camera_to_plate(
         arc_center_z_m + arc_radius_m * s,
     ], dtype=np.float64)
 
-    # camera forward (+Z) in plate coords = from camera toward arc center.
-    # at theta=0: (-1,0,0). at theta=90: (0,0,-1). at theta=180: (1,0,0).
-    forward = np.array([-c, 0.0, -s], dtype=np.float64)
-
-    # camera down (+Y) in plate coords. rotates with the arc so the
-    # image stays consistently oriented as the camera sweeps overhead.
-    # at theta=0: (0,0,-1). at theta=90: (1,0,0). at theta=180: (0,0,1).
-    down = np.array([s, 0.0, -c], dtype=np.float64)
-
-    # camera right (+X) = down x forward, right-handed.
-    right = np.cross(down, forward)
+    # lookat construction: forward points from camera toward plate origin,
+    # world-up stabilized (image-up stays aligned with world +Y).
+    forward = -cam_pos / np.linalg.norm(cam_pos)
+    world_up = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+    right = np.cross(world_up, forward)
     right = right / np.linalg.norm(right)
-
+    down = np.cross(forward, right)
     R = np.column_stack([right, down, forward]).astype(np.float64)
-
     T = np.eye(4, dtype=np.float64)
     T[:3, :3] = R
     T[:3, 3] = cam_pos
