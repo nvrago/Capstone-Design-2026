@@ -156,13 +156,14 @@ class RealSenseCapture:
 
         self.hole_filling = rs.hole_filling_filter()
 
-    def _apply_filters(self, depth_frame):
+    def _apply_filters(self, depth_frame, skip_temporal: bool = False):
         """run depth frame through the filter chain."""
         frame = depth_frame
         frame = self.threshold.process(frame)   # clip invalid / out-of-range first
         frame = self.decimation.process(frame)
         frame = self.spatial.process(frame)
-        frame = self.temporal.process(frame)
+        if not skip_temporal:
+            frame = self.temporal.process(frame)
         frame = self.hole_filling.process(frame)
         return frame
 
@@ -296,6 +297,95 @@ class RealSenseCapture:
 
         return pcd
 
+    def capture_frames(self, angle_deg: float = None):
+        """
+        capture raw depth + color arrays plus pose and intrinsics.
+
+        returns the data tsdf integration needs without going through
+        the rs.pointcloud -> open3d conversion. every n-frame temporal
+        sample is captured separately (no temporal averaging) so tsdf
+        can do its own volumetric averaging at the voxel level.
+
+        args:
+            angle_deg: arc angle for pose computation. if None, pose is
+                       identity (camera-frame output, debug use only).
+
+        returns:
+            frames: list of (depth_array, color_array) tuples. depth is
+                    uint16 raw sensor units; color is uint8 hxwx3 rgb.
+                    both aligned + decimated + spatial filtered.
+            intrinsics: open3d PinholeCameraIntrinsic matching the
+                        decimated depth resolution.
+            plate_T_camera: 4x4 float64 matrix. identity if angle_deg is None.
+            depth_scale_m: meters per depth sensor unit (d405: 0.0001).
+        """
+        depth_sensor = self.profile.get_device().first_depth_sensor()
+        depth_scale_m = depth_sensor.get_depth_scale()
+
+        logger.info(f"capturing {self.temporal_frames} frames for tsdf integration...")
+
+        frames = []
+        intrinsics = None
+
+        for i in range(self.temporal_frames):
+            frameset = self.pipeline.wait_for_frames()
+            aligned = self.align.process(frameset)
+
+            depth = aligned.get_depth_frame()
+            color = aligned.get_color_frame()
+
+            if not depth or not color:
+                logger.warning(f"frame {i}: missing depth or color, skipping")
+                continue
+
+            # spatial + decimation filters only; NO temporal (tsdf handles
+            # that at the voxel level across frames).
+            depth = self._apply_filters(depth, skip_temporal=True)
+
+            depth_array = np.asanyarray(depth.get_data())
+            color_array = np.asanyarray(color.get_data())[:, :, ::-1].copy()
+
+            if intrinsics is None:
+                stream = depth.profile.as_video_stream_profile()
+                intr = stream.get_intrinsics()
+                intrinsics = o3d.camera.PinholeCameraIntrinsic(
+                    width=intr.width,
+                    height=intr.height,
+                    fx=intr.fx,
+                    fy=intr.fy,
+                    cx=intr.ppx,
+                    cy=intr.ppy,
+                )
+
+            # handle shape mismatch between decimated depth and full color
+            if depth_array.shape[:2] != color_array.shape[:2]:
+                h_target, w_target = depth_array.shape[:2]
+                h_src, w_src = color_array.shape[:2]
+                ys = (np.arange(h_target) * h_src / h_target).astype(np.int32)
+                xs = (np.arange(w_target) * w_src / w_target).astype(np.int32)
+                color_array = color_array[ys[:, None], xs[None, :]]
+
+            frames.append((depth_array, color_array))
+
+        if not frames:
+            raise RuntimeError("failed to capture valid frames from realsense")
+
+        if angle_deg is not None:
+            plate_T_camera = camera_to_plate(
+                angle_deg,
+                arc_radius_m=self.arc_radius_m,
+                arc_center_z_m=self.arc_center_z_m,
+            )
+        else:
+            plate_T_camera = np.eye(4, dtype=np.float64)
+
+        logger.info(
+            f"captured {len(frames)} frames at {angle_deg or 0:.1f} deg: "
+            f"depth {frames[0][0].shape}, color {frames[0][1].shape}"
+        )
+
+        return frames, intrinsics, plate_T_camera, depth_scale_m
+    
     def capture(self, angle_deg: float = None, output_path: str = None):
         """
         full single-view capture: frames -> temporal avg -> point cloud.
