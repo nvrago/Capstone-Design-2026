@@ -95,10 +95,20 @@ class ToolpathGenerator:
 
         self._ocl_surface = ocl.STLSurf()
         triangles = np.asarray(mesh.triangles)
+        n_skipped = 0
+        eps_mm = 1e-6
         for tri in triangles:
             p1 = ocl.Point(*verts_mm[tri[0]])
             p2 = ocl.Point(*verts_mm[tri[1]])
             p3 = ocl.Point(*verts_mm[tri[2]])
+            v1 = verts_mm[tri[0]]
+            v2 = verts_mm[tri[1]]
+            v3 = verts_mm[tri[2]]
+            if (np.linalg.norm(v1 - v2) < eps_mm or
+                np.linalg.norm(v2 - v3) < eps_mm or
+                np.linalg.norm(v3 - v1) < eps_mm):
+                n_skipped += 1
+                continue
             t = ocl.Triangle(p1, p2, p3)
             self._ocl_surface.addTriangle(t)
 
@@ -108,7 +118,8 @@ class ToolpathGenerator:
             'z': (float(min_b[2] - max_b[2]), 0.0),
         }
 
-        logger.info(f"Loaded {len(triangles)} triangles into OCL surface "
+        logger.info(f"Loaded {len(triangles) - n_skipped}/{len(triangles)} triangles into OCL surface "
+                    f"(skipped {n_skipped} degenerate) "
                     f"(m -> mm, shifted to origin). "
                     f"bounds: x={self._bounds_mm['x']}, "
                     f"y={self._bounds_mm['y']}, z={self._bounds_mm['z']}")
