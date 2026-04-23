@@ -158,15 +158,13 @@ class RealSenseCapture:
 
         self.hole_filling = rs.hole_filling_filter()
 
-    def _apply_filters(self, depth_frame, skip_temporal: bool = False):
+    def _apply_filters(self, depth_frame):
         """run depth frame through the filter chain."""
         frame = depth_frame
-        if not skip_temporal:  # tsdf depth_trunc handles this instead
-            frame = self.threshold.process(frame)   # clip invalid / out-of-range first
+        frame = self.threshold.process(frame)   # clip invalid / out-of-range first
         frame = self.decimation.process(frame)
         frame = self.spatial.process(frame)
-        if not skip_temporal:
-            frame = self.temporal.process(frame)
+        frame = self.temporal.process(frame)
         frame = self.hole_filling.process(frame)
         return frame
 
@@ -343,7 +341,15 @@ class RealSenseCapture:
 
             # spatial + decimation filters only; NO temporal (tsdf handles
             # that at the voxel level across frames).
-            depth = self._apply_filters(depth, skip_temporal=True)
+            if not hasattr(self, "_tsdf_decimation"):
+                self._tsdf_decimation = rs.decimation_filter()
+                self._tsdf_decimation.set_option(rs.option.filter_magnitude, self.decimation_magnitude)
+                self._tsdf_spatial = rs.spatial_filter()
+                self._tsdf_spatial.set_option(rs.option.filter_magnitude, 2)
+                self._tsdf_spatial.set_option(rs.option.filter_smooth_alpha, 0.5)
+                self._tsdf_spatial.set_option(rs.option.filter_smooth_delta, 20)
+            depth = self._tsdf_decimation.process(depth)
+            depth = self._tsdf_spatial.process(depth)
 
             depth_array = np.asanyarray(depth.get_data())
             color_array = np.asanyarray(color.get_data())[:, :, ::-1].copy()
