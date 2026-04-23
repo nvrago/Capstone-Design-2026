@@ -85,7 +85,7 @@ class ToolpathGenerator:
         returns the shifted+scaled bounds in mm so the caller doesn't have
         to guess what coordinate space the toolpath lives in.
         """
-        verts_mm = mesh.vertices * 1000.0
+        verts_mm = np.asarray(mesh.vertices) * 1000.0
 
         # shift so min corner -> (0,0) and top -> 0 (cuts go negative Z)
         min_b = verts_mm.min(axis=0)
@@ -94,7 +94,7 @@ class ToolpathGenerator:
         verts_mm = verts_mm + shift
 
         self._ocl_surface = ocl.STLSurf()
-        triangles = mesh.triangles
+        triangles = np.asarray(mesh.triangles)
         for tri in triangles:
             p1 = ocl.Point(*verts_mm[tri[0]])
             p2 = ocl.Point(*verts_mm[tri[1]])
