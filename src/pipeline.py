@@ -516,8 +516,40 @@ class ScanPipeline:
         # Mesh wrapper provides .remove_degenerate / .compute_normals /
         # .get_bounds / .triangle_count / .mesh — all methods stage 5
         # and the toolpath generator use.
+        # crop the raw tsdf mesh to the bounding box of the cluster-filtered
+        # point cloud. this is what removes the plate and surrounding junk
+        # from the mesh before it goes to opencamlib. without this, ocl
+        # toolpaths the entire plate too.
+        import open3d as _o3d
+        _raw = self._raw_mesh
+        if self.processed_cloud is not None and len(self.processed_cloud.points) > 0:
+            bbox = self.processed_cloud.get_axis_aligned_bounding_box()
+            # expand a few mm in each direction so the object's side walls
+            # and base aren't clipped. z_min drops to the plate clip
+            # (z_min_m from config) so the walls extend down to the plate.
+            margin = 0.005
+            min_b = bbox.min_bound.copy()
+            max_b = bbox.max_bound.copy()
+            min_b[0] -= margin
+            min_b[1] -= margin
+            min_b[2] = self.config.clip_z_min_m   # drop to plate clip floor
+            max_b[0] += margin
+            max_b[1] += margin
+            max_b[2] += margin
+            crop_bbox = _o3d.geometry.AxisAlignedBoundingBox(min_b, max_b)
+            before = len(_raw.triangles)
+            _raw = _raw.crop(crop_bbox)
+            after = len(_raw.triangles)
+            logger.info(f"stage_4: cropped mesh to object bbox "
+                        f"({before} -> {after} tris, "
+                        f"x=[{min_b[0]*1000:.0f},{max_b[0]*1000:.0f}]mm "
+                        f"y=[{min_b[1]*1000:.0f},{max_b[1]*1000:.0f}]mm "
+                        f"z=[{min_b[2]*1000:.0f},{max_b[2]*1000:.0f}]mm)")
+        else:
+            logger.warning("stage_4: no processed_cloud, mesh not cropped")
+
         mesh = Mesh()
-        mesh.mesh = self._raw_mesh
+        mesh.mesh = _raw
         mesh.remove_degenerate()
 
         # extra degeneracy sweep: open3d's remove_duplicated_vertices only
