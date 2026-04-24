@@ -138,7 +138,7 @@ class PipelineConfig:
     poisson_scale: float = 1.1
     alpha_shape_alpha: float = 0.010
     ball_pivoting_radii: list = field(default_factory=lambda: [0.003, 0.006, 0.012])
-    extrude_to_plate: bool = False
+    extrude_to_plate: bool = True
     filter_black_threshold: int = None
 
     # toolpath
@@ -579,6 +579,17 @@ class ScanPipeline:
                 mesh.mesh.remove_unreferenced_vertices()
 
         mesh.compute_normals()
+
+        # seal the open heightmap into a watertight solid by walling boundary
+        # loops down to plate_z and capping the bottom. does not remove the
+        # plate — just closes the mesh so ocl sees a solid and renderers show
+        # a block instead of a lid.
+        if self.config.extrude_to_plate:
+            logger.info("stage_4: extruding heightmap to plate (z=0)")
+            before_tri = mesh.triangle_count
+            mesh.extrude_to_plate(plate_z=0.0)
+            logger.info(f"stage_4: extrude added {mesh.triangle_count - before_tri} "
+                        f"triangles ({before_tri} -> {mesh.triangle_count})")
 
         self._save(mesh, "mesh.stl")
         self._save(mesh, "mesh.ply")
