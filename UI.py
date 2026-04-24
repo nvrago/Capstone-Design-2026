@@ -9,6 +9,7 @@ import queue
 import threading
 import numpy as np
 import subprocess
+from pathlib import Path
 import os
 os.environ["QT_API"] = "pyqt5"   # pin pyvistaqt/qtpy to PyQt5
 os.environ["QT_QPA_PLATFORM"] = "xcb"
@@ -231,6 +232,85 @@ QFrame#divider {
 }
 """
 
+# ── G-code parser ────────────────────────────────────────────────────────────
+def parse_gcode_toolpath(path: Path):
+    """Parse a G-code file into two PolyData line sets: rapids and cuts.
+
+    Tracks modal motion mode (G0 = rapid, G1 = linear cut) and current
+    XYZ position. Each move becomes a 2-point line segment in the
+    appropriate group. Returns (rapids, cuts, n_rapid, n_cut), where
+    rapids/cuts may be None if no segments of that type exist.
+
+    Ignores: feed rate (F), spindle (M/S), comments (; or parens), arcs
+    (G2/G3 — treated as straight moves to endpoint), and all other
+    G-words. Good enough for visualizing a 3-axis milling toolpath; not
+    a g-code interpreter.
+    """
+    rapid_pts, rapid_lines = [], []
+    cut_pts, cut_lines     = [], []
+
+    x = y = z = 0.0
+    mode = None
+    n_rapid = n_cut = 0
+
+    with open(path, "r") as f:
+        for raw in f:
+            # Strip semicolon comments
+            line = raw.split(";", 1)[0]
+            # Strip parenthetical comments
+            while "(" in line and ")" in line:
+                a = line.index("(")
+                b = line.index(")", a)
+                line = line[:a] + line[b + 1:]
+            line = line.strip().upper()
+            if not line:
+                continue
+
+            new_x, new_y, new_z = x, y, z
+            new_mode = mode
+            has_motion = False
+
+            for tok in line.split():
+                if tok in ("G0", "G00"):
+                    new_mode = "G0"
+                elif tok in ("G1", "G01", "G2", "G02", "G3", "G03"):
+                    # Treat arcs as straight moves to endpoint — fine for viz
+                    new_mode = "G1"
+                elif tok.startswith("X"):
+                    try: new_x = float(tok[1:]); has_motion = True
+                    except ValueError: pass
+                elif tok.startswith("Y"):
+                    try: new_y = float(tok[1:]); has_motion = True
+                    except ValueError: pass
+                elif tok.startswith("Z"):
+                    try: new_z = float(tok[1:]); has_motion = True
+                    except ValueError: pass
+
+            mode = new_mode
+            if has_motion and mode in ("G0", "G1"):
+                if mode == "G0":
+                    pts, lines = rapid_pts, rapid_lines
+                    n_rapid += 1
+                else:
+                    pts, lines = cut_pts, cut_lines
+                    n_cut += 1
+                i = len(pts)
+                pts.append((x, y, z))
+                pts.append((new_x, new_y, new_z))
+                lines.extend([2, i, i + 1])
+                x, y, z = new_x, new_y, new_z
+
+    rapids = None
+    if rapid_pts:
+        rapids = pv.PolyData(np.array(rapid_pts, dtype=np.float32))
+        rapids.lines = np.array(rapid_lines, dtype=np.int32)
+
+    cuts = None
+    if cut_pts:
+        cuts = pv.PolyData(np.array(cut_pts, dtype=np.float32))
+        cuts.lines = np.array(cut_lines, dtype=np.int32)
+
+    return rapids, cuts, n_rapid, n_cut
 
 # ── Empty point cloud helper ──────────────────────────────────────────────────
 def make_empty_pointcloud() -> pv.PolyData:
@@ -818,6 +898,122 @@ STEP_VEL_SPS   = 2000    # matches SCAN_VEL_SPS on the ClearCore
 STEP_ACCEL_SPSPS = 20000
 
 
+# ── Run output watcher ───────────────────────────────────────────────────────
+RUNS_DIR = Path("/home/capstone/Capstone-Design-2026/data/runs")
+RUN_POLL_INTERVAL_MS = 2000
+
+CLOUD_FILENAME    = "processed.ply"
+MESH_FILENAME     = "mesh.stl"
+TOOLPATH_FILENAME = "toolpath.gcode"
+
+    # ── Run-folder loader ────────────────────────────────────────────────────
+    def _get_latest_run_folder(self):
+        """Most recently modified subfolder of data/runs, or None."""
+        if not RUNS_DIR.exists():
+            return None
+        folders = [f for f in RUNS_DIR.iterdir() if f.is_dir()]
+        if not folders:
+            return None
+        return max(folders, key=lambda f: f.stat().st_mtime)
+
+    def _find_run_files(self, run_dir: Path):
+        """Locate cloud, mesh, and toolpath files inside a run folder.
+
+        Returns (cloud_path, mesh_path, gcode_path); any may be None.
+        """
+        cloud = run_dir / CLOUD_FILENAME
+        mesh  = run_dir / MESH_FILENAME
+        gcode = run_dir / TOOLPATH_FILENAME
+        return (
+            cloud if cloud.exists() else None,
+            mesh  if mesh.exists()  else None,
+            gcode if gcode.exists() else None,
+        )
+
+    def _load_run_files(self, run_dir: Path):
+        """Load cloud, mesh, and toolpath from run_dir into the viewport."""
+        if not hasattr(self, "plotter"):
+            self._log("[VIZ] Viewport not ready — cannot load run files.")
+            return
+
+        cloud_path, mesh_path, gcode_path = self._find_run_files(run_dir)
+        if cloud_path is None and mesh_path is None and gcode_path is None:
+            self._log(f"[VIZ] No output files in {run_dir.name}")
+            return
+
+        if cloud_path is not None:
+            try:
+                cloud = pv.read(str(cloud_path))
+                if "depth" not in cloud.point_data and cloud.n_points > 0:
+                    cloud["depth"] = cloud.points[:, 2]
+                self._cloud = cloud
+                self._log(f"[VIZ] Loaded cloud: {cloud_path.name} "
+                          f"({cloud.n_points} pts)")
+            except Exception as e:
+                self._log(f"[VIZ] Cloud load failed ({cloud_path.name}): {e}")
+
+        if mesh_path is not None:
+            try:
+                self._mesh = pv.read(str(mesh_path))
+                self._log(f"[VIZ] Loaded mesh: {mesh_path.name} "
+                          f"({self._mesh.n_cells} cells)")
+            except Exception as e:
+                self._log(f"[VIZ] Mesh load failed ({mesh_path.name}): {e}")
+
+        if gcode_path is not None:
+            try:
+                rapids, cuts, n_rapid, n_cut = parse_gcode_toolpath(gcode_path)
+                self._toolpath_rapids = rapids
+                self._toolpath_cuts = cuts
+                self._log(f"[VIZ] Loaded toolpath: {gcode_path.name} "
+                          f"({n_cut} cuts, {n_rapid} rapids)")
+            except Exception as e:
+                self._log(f"[VIZ] Toolpath load failed ({gcode_path.name}): {e}")
+
+        self._refresh_viewport()
+        self.plotter.reset_camera()
+        self.btn_export.setEnabled(True)
+
+# ── Run-folder watcher ───────────────────────────────────────────────────
+    def _start_run_watcher(self):
+        """Begin polling data/runs for a folder newer than what's there now."""
+        self._pre_scan_latest_run = self._get_latest_run_folder()
+        self._pending_load = None
+        if not hasattr(self, "_run_watch_timer"):
+            self._run_watch_timer = QTimer(self)
+            self._run_watch_timer.timeout.connect(self._check_for_new_run)
+        self._run_watch_timer.start(RUN_POLL_INTERVAL_MS)
+        self._log("[VIZ] Watching data/runs for new output...")
+
+    def _stop_run_watcher(self):
+        if hasattr(self, "_run_watch_timer"):
+            self._run_watch_timer.stop()
+
+    def _check_for_new_run(self):
+        latest = self._get_latest_run_folder()
+        if latest is None or latest == self._pre_scan_latest_run:
+            return
+
+        cloud_path, mesh_path, gcode_path = self._find_run_files(latest)
+        if cloud_path is None and mesh_path is None and gcode_path is None:
+            return
+
+        sizes = {}
+        for tag, p in (("cloud", cloud_path), ("mesh", mesh_path),
+                       ("gcode", gcode_path)):
+            if p is not None:
+                sizes[tag] = p.stat().st_size
+
+        if self._pending_load == (latest, sizes):
+            self._stop_run_watcher()
+            self._log(f"[VIZ] New run detected: {latest.name}")
+            self._load_run_files(latest)
+            self._pre_scan_latest_run = latest
+            self._pending_load = None
+        else:
+            self._pending_load = (latest, sizes)
+
+
 class SteppedScanWorker(QThread):
     """Drive the carriage to a list of angles, pausing for a capture at each.
 
@@ -1307,6 +1503,9 @@ class ScanToMillUI(QMainWindow):
         # ── Post-Processing ──
         grp2 = QGroupBox("Post-Process")
         g2 = QVBoxLayout(grp2)
+        self.btn_load_latest = QPushButton("Load Latest Run")
+        self.btn_load_latest.clicked.connect(self._on_load_latest)
+        g2.addWidget(self.btn_load_latest)
         self.btn_export = QPushButton("Export STL")
         self.btn_export.setEnabled(False)
         g2.addWidget(self.btn_export)
@@ -1398,39 +1597,68 @@ class ScanToMillUI(QMainWindow):
 
         # Empty point cloud placeholder — real data will come from the camera
         self._cloud = make_empty_pointcloud()
+        self._mesh = None                            # <-- add
+        self._toolpath_rapids = None        # <-- add
+        self._toolpath_cuts = None          # <-- add
         self.plotter.add_axes(color="#4a6a7a")
         self.plotter.camera_position = "iso"
         self._view_mode = "cloud"
         self._log("[VIZ] Viewport ready — awaiting camera stream")
 
     def _set_view_mode(self, mode):
+        """Switch the viewport to 'cloud', 'mesh', or 'cnc' and re-render."""
         if not hasattr(self, "plotter"):
-            return  # Viewport not initialized yet
+            return
         self._view_mode = mode
+
+        # Clear all known actors so switching modes is clean
+        for name in ("pointcloud", "mesh_actor", "tp_cuts", "tp_rapids"):
+            self.plotter.remove_actor(name)
+
         if mode == "cloud":
             self.lbl_render_mode.setText("MODE: POINT CLOUD")
-            self.plotter.remove_actor("mesh_actor")
-            self.plotter.add_mesh(
-                self._cloud, scalars="depth", cmap="cool",
-                point_size=3, render_points_as_spheres=True,
-                name="pointcloud", show_scalar_bar=False
-            )    
-        else:
+            if self._cloud is not None and self._cloud.n_points > 0:
+                self.plotter.add_mesh(
+                    self._cloud, scalars="depth", cmap="cool",
+                    point_size=3, render_points_as_spheres=True,
+                    name="pointcloud", show_scalar_bar=False,
+                )
+            else:
+                self._log("[VIZ] No point cloud loaded yet.")
+
+        elif mode == "mesh":
             self.lbl_render_mode.setText("MODE: MESH")
-            self.plotter.remove_actor("pointcloud")
-            if self._cloud is None or self._cloud.n_points < 4:
-                # Need at least a few points for surface reconstruction.
-                self._log("[VIZ] Mesh view: not enough points yet.")
-                self.plotter.render()
-                return
-            surf = self._cloud.reconstruct_surface(nbr_sz=10)
-            self.plotter.add_mesh(
-                surf, color="#2a5a7a", show_edges=False,
-                opacity=1.0, name="mesh_actor",
-                pbr=False, interpolate_before_map=False,
-            )
+            if getattr(self, "_mesh", None) is not None:
+                self.plotter.add_mesh(
+                    self._mesh, color="#2a5a7a", show_edges=False,
+                    opacity=1.0, name="mesh_actor",
+                )
+            else:
+                self._log("[VIZ] No mesh loaded yet.")
+
+        elif mode == "cnc":
+            self.lbl_render_mode.setText("MODE: CNC TOOLPATH")
+            cuts = getattr(self, "_toolpath_cuts", None)
+            rapids = getattr(self, "_toolpath_rapids", None)
+            if cuts is None and rapids is None:
+                self._log("[VIZ] No toolpath loaded yet.")
+            else:
+                if cuts is not None:
+                    self.plotter.add_mesh(
+                        cuts, color="#ff8c00", line_width=2,
+                        name="tp_cuts",
+                    )
+                if rapids is not None:
+                    self.plotter.add_mesh(
+                        rapids, color="#cc4d2d", line_width=1,
+                        opacity=0.45, name="tp_rapids",
+                    )
+
         self.plotter.render()
 
+    def _refresh_viewport(self):
+        """Re-render whichever view mode is currently active."""
+        self._set_view_mode(getattr(self, "_view_mode", "cloud"))
 
     def _reset_camera(self):
         if not hasattr(self, "plotter"):
@@ -1468,6 +1696,7 @@ class ScanToMillUI(QMainWindow):
         self._log("[SYS] START pressed — releasing ClearCore link for pipeline.")
 
         # 1. Hand the ClearCore over to the subprocess.
+        self._start_run_watcher()
         if hasattr(self, "_modbus") and self._modbus.isRunning():
             self._modbus.stop()
             self._modbus.wait(2000)
@@ -1621,7 +1850,8 @@ class ScanToMillUI(QMainWindow):
         if hasattr(self, "_modbus") and not self._modbus.isRunning():
             self._log("[SYS] Reconnecting to ClearCore...")
             self._init_modbus()
-
+            
+        self._stop_run_watcher()
         self._reset_scan_ui()
         self.progress_bar.setValue(0)
         self.progress_bar.setFormat("%p%  —  IDLE")
@@ -1656,10 +1886,20 @@ class ScanToMillUI(QMainWindow):
         self._scan_elapsed += 1
         m, s = divmod(self._scan_elapsed, 60)
         self.lbl_elapsed.setText(f"{m:02d}:{s:02d}")
+
+    def _on_load_latest(self):
+        """Manual trigger: load the most recent run folder, whatever it is."""
+        latest = self._get_latest_run_folder()
+        if latest is None:
+            self._log("[VIZ] No runs found in data/runs.")
+            return
+        self._log(f"[VIZ] Loading latest run: {latest.name}")
+        self._load_run_files(latest)
+        self._pre_scan_latest_run = latest   # so watcher won't reload it
         
     def _on_cnc_preview(self):
-        """ Placeholder — will render the CNC toolpath preview in the viewport."""
-        self._log("[VIEW] CNC preview not yet implemented.")
+        """Show the loaded toolpath in the viewport."""
+        self._set_view_mode("cnc")
 
     # ── Helpers ───────────────────────────────────────────────────────────────
     def _log(self, msg: str):
