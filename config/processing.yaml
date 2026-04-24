@@ -26,7 +26,7 @@ tsdf:
 # cluster_min_points    minimum points in a valid cluster
 clip:
   xy_extent_m: 0.100
-  z_min_m: 0.002
+  z_min_m: 0.010
   z_max_m: 0.100
   cluster_eps_m: 0.005
   cluster_min_points: 50

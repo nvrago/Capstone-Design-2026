@@ -112,9 +112,9 @@ class PipelineConfig:
     # tighter than stage-1 clip; kills plate surface, arc hardware,
     # and stragglers. sized to plate footprint and ~10cm object height.
     clip_xy_extent_m: float = 0.100
-    clip_z_min_m: float = 0.002
+    clip_z_min_m: float = 0.010
     clip_z_max_m: float = 0.100
-    cluster_eps_m: float = 0.002
+    cluster_eps_m: float = 0.005
     cluster_min_points: int = 50
 
     # legacy fields kept for config compatibility. from_yaml loads these
