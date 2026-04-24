@@ -10,6 +10,7 @@ import threading
 import numpy as np
 import subprocess
 import os
+os.environ["QT_API"] = "pyqt5"   # pin pyvistaqt/qtpy to PyQt5
 os.environ["QT_QPA_PLATFORM"] = "xcb"
 os.environ["LIBGL_ALWAYS_SOFTWARE"] = "1"           # <-- add
 os.environ["VTK_DISABLE_OPENGL_RENDER_TIMER"] = "1" # <-- add
@@ -18,6 +19,13 @@ os.environ["VTK_DISABLE_OPENGL_RENDER_TIMER"] = "1" # <-- add
 # when Qt is using the wayland backend on Raspberry Pi OS. xcb works
 # correctly on both X11 and Wayland sessions (via XWayland).
 os.environ["QT_QPA_PLATFORM"] = "xcb"
+# Detect and pin the Qt binding before importing pyvistaqt
+try:
+    import PyQt6  # noqa
+    os.environ["QT_API"] = "pyqt6"
+except ImportError:
+    os.environ["QT_API"] = "pyqt5"
+
 import pyvista as pv
 from pyvistaqt import QtInteractor
 
