@@ -1605,7 +1605,7 @@ class ScanToMillUI(QMainWindow):
             f"cd {home}\n"
             "source pipeline-env/bin/activate\n"
             "cd Capstone-Design-2026\n"
-            "python scripts/run_pipeline.py --single-angle 90\n"
+            "python scripts/run_pipeline.py --single-angle 90 --skip-execute\n"
             "echo\n"
             "echo '--- Pipeline finished. Press Enter to close this window. ---'\n"
             "read\n"
