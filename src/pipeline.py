@@ -601,7 +601,15 @@ class ScanPipeline:
     # stage 5: toolpath
 
     def stage_5_toolpath(self):
-        """opencamlib surface dropcutter + g-code."""
+        """opencamlib surface dropcutter + g-code, normalized to work-zero.
+
+        translates the mesh so its min corner is at (0, 0, 0) before feeding
+        to ocl. this guarantees all g-code coords are positive and the work
+        origin on the cnc maps to the bottom-front-left of the part. after
+        dropcutter returns, clamps every point's z to >= 0 to kill spikes
+        from degenerate triangles or ocl sentinel values. finally injects
+        an explicit park move at the start and end of the g-code so the
+        toolchange / home position is predictable."""
         logger.info("=== stage 5: toolpath ===")
         start = time.time()
 
@@ -613,13 +621,26 @@ class ScanPipeline:
             diameter=self.config.cutter_diameter,
             length=self.config.cutter_length,
         )
-        generator = ToolpathGenerator(cutter=cutter)
-        generator.load_mesh(self.mesh)
 
-        # mesh is in meters; toolpath generator works in mm. scale bounds.
+        # shift mesh so min_bound -> origin. the Mesh wrapper exposes the
+        # underlying o3d mesh via .mesh, so we translate in place.
+        min_bound, max_bound = self.mesh.get_bounds()
+        translate = -np.asarray(min_bound, dtype=np.float64)
+        self.mesh.mesh.translate(translate.tolist(), relative=True)
+        logger.info(f"stage_5: shifted mesh by {translate*1000} mm "
+                    f"(new origin = old min corner)")
+
+        # recompute bounds post-shift for ocl
         min_bound, max_bound = self.mesh.get_bounds()
         min_bound_mm = min_bound * 1000.0
         max_bound_mm = max_bound * 1000.0
+        logger.info(f"stage_5: ocl bounds (mm): "
+                    f"x=[{min_bound_mm[0]:.1f},{max_bound_mm[0]:.1f}] "
+                    f"y=[{min_bound_mm[1]:.1f},{max_bound_mm[1]:.1f}] "
+                    f"z=[{min_bound_mm[2]:.1f},{max_bound_mm[2]:.1f}]")
+
+        generator = ToolpathGenerator(cutter=cutter)
+        generator.load_mesh(self.mesh)
 
         passes = generator.surface_dropcutter(
             x_min=min_bound_mm[0], x_max=max_bound_mm[0],
@@ -627,6 +648,17 @@ class ScanPipeline:
             stepover=self.config.stepover,
             direction=self.config.surface_direction,
         )
+
+        # clamp z to >= 0 on every pass point. kills spikes below plate.
+        n_clamped = 0
+        for pass_points in passes:
+            for pt in pass_points:
+                if pt.z < 0:
+                    pt.z = 0.0
+                    n_clamped += 1
+        if n_clamped:
+            logger.info(f"stage_5: clamped {n_clamped} pass points with z<0 to z=0")
+
         passes = generator.add_lead_in_out(passes, self.config.clearance_height)
 
         writer = GcodeWriter(GcodeConfig(
@@ -636,6 +668,35 @@ class ScanPipeline:
             dialect="grbl",
         ))
         writer.from_toolpath(passes, clearance_z=self.config.clearance_height)
+
+        # inject a park move at the start (right after header/spindle) and
+        # a park move at the end (right before footer). the writer already
+        # emits a "rapid z=clearance" near the top; we insert a
+        # "rapid x=0 y=0 z=clearance" after it so the first cutting move
+        # isn't a wild rapid from wherever the machine currently is.
+        # similarly we append a final return-to-park before the footer.
+        park_line = f"G0 X0.000 Y0.000 Z{self.config.clearance_height:.3f} ; park"
+        footer_idx = None
+        for i, line in enumerate(writer.lines):
+            if line.strip().startswith("M30") or line.strip().startswith("; end"):
+                footer_idx = i
+                break
+        # find the initial rapid-to-clearance and insert park right after
+        for i, line in enumerate(writer.lines):
+            stripped = line.strip()
+            if stripped.startswith("G0") and f"Z{self.config.clearance_height:.3f}" in stripped \
+                    and "X" not in stripped and "Y" not in stripped:
+                writer.lines.insert(i + 1, park_line)
+                logger.info(f"stage_5: injected start park at line {i+1}")
+                if footer_idx is not None:
+                    footer_idx += 1
+                break
+        # append end park before footer
+        if footer_idx is not None:
+            writer.lines.insert(footer_idx, park_line)
+            logger.info(f"stage_5: injected end park at line {footer_idx}")
+        else:
+            writer.lines.append(park_line)
 
         self.gcode_path = self.run_dir / "toolpath.gcode"
         writer.save(str(self.gcode_path))
