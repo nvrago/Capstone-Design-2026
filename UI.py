@@ -1461,14 +1461,23 @@ class ScanToMillUI(QMainWindow):
     def _on_start(self):
         """Launch the external pipeline script in a terminal window.
 
-        Replaces the in-UI stepped-scan workflow entirely — run_pipeline.py
-        drives the PLC and camera on its own. No Modbus commands, no pipeline
-        socket messages, and no worker threads are spawned from here.
-        """
-        self._log("[SYS] START pressed — launching run_pipeline.py in a new terminal.")
+        Releases the UI's Modbus link first — the ClearCore's Modbus server
+        only handles one client at a time, and the subprocess needs exclusive
+        access to issue motion commands.
+         """
+        self._log("[SYS] START pressed — releasing ClearCore link for pipeline.")
 
-        # Launcher script. Final 'read' keeps the window open so the user
-        # can see the output after the pipeline exits.
+        # 1. Hand the ClearCore over to the subprocess.
+        if hasattr(self, "_modbus") and self._modbus.isRunning():
+            self._modbus.stop()
+            self._modbus.wait(2000)
+            self._log("[SYS] UI Modbus link released.")
+
+        # Also tell server.py to wrap up any session, in case it's running.
+        if hasattr(self, "_pipeline"):
+            self._pipeline.send_cmd(cmd="end_scan_session")
+
+        # 2. Write the launcher script.
         home = os.path.expanduser("~")
         script_body = (
             "#!/bin/bash\n"
@@ -1489,9 +1498,7 @@ class ScanToMillUI(QMainWindow):
             self._log(f"[SYS] Could not write launcher script: {e}")
             return
 
-        # Try a few terminal emulators in preference order. lxterminal is the
-        # default on Raspberry Pi OS Bookworm; x-terminal-emulator is the
-        # Debian alias; xterm is the universal fallback.
+        # 3. Launch a terminal running it.
         for term_cmd in (
             ["lxterminal", "-e", script_path],
             ["x-terminal-emulator", "-e", script_path],
@@ -1508,7 +1515,6 @@ class ScanToMillUI(QMainWindow):
                       "(tried lxterminal, x-terminal-emulator, xterm).")
             return
 
-        # Minimal UI feedback — no phase transitions, no timers, no workers.
         self.btn_start.setEnabled(False)
         self.btn_stop.setEnabled(True)
         self.progress_bar.setFormat("RUNNING EXTERNAL PIPELINE")
@@ -1608,8 +1614,14 @@ class ScanToMillUI(QMainWindow):
             self._scan_worker.stop()
         if hasattr(self, "_stepped_worker") and self._stepped_worker.isRunning():
             self._stepped_worker.stop()
-        self._modbus.send_command(CCMD_STOP)
-        self._pipeline.send_cmd(cmd="end_scan_session")
+        if hasattr(self, "_pipeline"):
+            self._pipeline.send_cmd(cmd="end_scan_session")
+
+        # Re-establish the UI's Modbus link if it was torn down for the pipeline.
+        if hasattr(self, "_modbus") and not self._modbus.isRunning():
+            self._log("[SYS] Reconnecting to ClearCore...")
+            self._init_modbus()
+
         self._reset_scan_ui()
         self.progress_bar.setValue(0)
         self.progress_bar.setFormat("%p%  —  IDLE")
