@@ -647,74 +647,6 @@ def unpack_i32(regs) -> int:
         raw -= 0x100000000
     return raw
 
-# ── Read-only status watchdog ─────────────────────────────────────────────
-# Runs *instead of* the main ClearCoreModbus thread while the external
-# pipeline owns the link. Reads just the status word on a slow cadence —
-# enough to spot an e-stop and show the banner, but infrequent enough to
-# coexist peacefully with the pipeline's Modbus traffic.
-
-class ModbusStatusWatchdog(QThread):
-    status_update = pyqtSignal(dict)
-    log_message   = pyqtSignal(str)
-
-    POLL_INTERVAL_MS = 500   # slow — don't clash with pipeline writes
-
-    def __init__(self, host=MODBUS_DEFAULT_HOST,
-                 tcp_port=MODBUS_DEFAULT_TCP_PORT,
-                 slave_id=MODBUS_DEFAULT_SLAVE_ID, parent=None):
-        super().__init__(parent)
-        self._host = host
-        self._tcp_port = tcp_port
-        self._slave_id = slave_id
-        self._stop_flag = False
-
-    def stop(self):
-        self._stop_flag = True
-
-    def run(self):
-        if not _PYMODBUS_AVAILABLE:
-            return
-
-        while not self._stop_flag:
-            client = None
-            try:
-                client = ModbusTcpClient(host=self._host, port=self._tcp_port,
-                                         timeout=1.0)
-                if not client.connect():
-                    # ClearCore busy servicing the pipeline — back off and retry
-                    self.msleep(1000)
-                    continue
-
-                # Poll status word only (1 reg) for as long as we can hold
-                # the connection.
-                while not self._stop_flag:
-                    try:
-                        rsp = client.read_holding_registers(
-                            W_STATUS, count=1, device_id=self._slave_id)
-                        if rsp.isError():
-                            break   # drop and reconnect
-                        status_word = rsp.registers[0] & 0xFFFF
-                        parsed = {
-                            "raw":    status_word,
-                            "estop":  bool(status_word & STATUS_ESTOP),
-                            "fault":  bool(status_word & STATUS_FAULT),
-                            "moving": bool(status_word & STATUS_MOVING),
-                            "homed":  bool(status_word & STATUS_HOMED),
-                            # Other fields left off because we only care
-                            # about the safety-critical ones during a run
-                        }
-                        self.status_update.emit(parsed)
-                    except Exception:
-                        break   # drop and reconnect
-
-                    self.msleep(self.POLL_INTERVAL_MS)
-            except Exception as e:
-                self.log_message.emit(f"[WDOG] {e}")
-                self.msleep(1000)
-            finally:
-                if client is not None:
-                    try: client.close()
-                    except Exception: pass
                         
 class ClearCoreModbus(QThread):
     """Background worker that owns the Modbus TCP link to the ClearCore.
@@ -1662,13 +1594,6 @@ class ScanToMillUI(QMainWindow):
             self._modbus.wait(2000)
             self._log("[SYS] UI Modbus link released.")
 
-        # 1b. Spin up the read-only watchdog so we can still see e-stop.
-        self._watchdog = ModbusStatusWatchdog()
-        self._watchdog.status_update.connect(self._on_modbus_status)
-        self._watchdog.log_message.connect(self._log)
-        self._watchdog.start()
-        self._log("[SYS] E-stop watchdog active.")
-
         # Also tell server.py to wrap up any session, in case it's running.
         if hasattr(self, "_pipeline"):
             self._pipeline.send_cmd(cmd="end_scan_session")
@@ -1813,10 +1738,6 @@ class ScanToMillUI(QMainWindow):
         if hasattr(self, "_pipeline"):
             self._pipeline.send_cmd(cmd="end_scan_session")
 
-        # Stop the read-only watchdog before reclaiming the link.
-        if hasattr(self, "_watchdog") and self._watchdog.isRunning():
-            self._watchdog.stop()
-            self._watchdog.wait(2000)
 
         # Re-establish the UI's Modbus link
         if hasattr(self, "_modbus") and not self._modbus.isRunning():
