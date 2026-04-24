@@ -906,114 +906,6 @@ CLOUD_FILENAME    = "processed.ply"
 MESH_FILENAME     = "mesh.stl"
 TOOLPATH_FILENAME = "toolpath.gcode"
 
-    # ── Run-folder loader ────────────────────────────────────────────────────
-def _get_latest_run_folder(self):
-    """Most recently modified subfolder of data/runs, or None."""
-    if not RUNS_DIR.exists():
-        return None
-    folders = [f for f in RUNS_DIR.iterdir() if f.is_dir()]
-    if not folders:
-        return None
-    return max(folders, key=lambda f: f.stat().st_mtime)
-
-def _find_run_files(self, run_dir: Path):
-    """Locate cloud, mesh, and toolpath files inside a run folder.
-
-    Returns (cloud_path, mesh_path, gcode_path); any may be None.
-    """
-    cloud = run_dir / CLOUD_FILENAME
-    mesh  = run_dir / MESH_FILENAME
-    gcode = run_dir / TOOLPATH_FILENAME
-    return (
-        cloud if cloud.exists() else None,
-        mesh  if mesh.exists()  else None,
-        gcode if gcode.exists() else None,
-    )
-
-def _load_run_files(self, run_dir: Path):
-    """Load cloud, mesh, and toolpath from run_dir into the viewport."""
-    if not hasattr(self, "plotter"):
-        self._log("[VIZ] Viewport not ready — cannot load run files.")
-        return
-
-    cloud_path, mesh_path, gcode_path = self._find_run_files(run_dir)
-    if cloud_path is None and mesh_path is None and gcode_path is None:
-        self._log(f"[VIZ] No output files in {run_dir.name}")
-        return
-
-    if cloud_path is not None:
-        try:
-            cloud = pv.read(str(cloud_path))
-            if "depth" not in cloud.point_data and cloud.n_points > 0:
-                cloud["depth"] = cloud.points[:, 2]
-            self._cloud = cloud
-            self._log(f"[VIZ] Loaded cloud: {cloud_path.name} "
-                          f"({cloud.n_points} pts)")
-        except Exception as e:
-            self._log(f"[VIZ] Cloud load failed ({cloud_path.name}): {e}")
-
-    if mesh_path is not None:
-        try:
-            self._mesh = pv.read(str(mesh_path))
-            self._log(f"[VIZ] Loaded mesh: {mesh_path.name} "
-                        f"({self._mesh.n_cells} cells)")
-        except Exception as e:
-            self._log(f"[VIZ] Mesh load failed ({mesh_path.name}): {e}")
-
-    if gcode_path is not None:
-        try:
-            rapids, cuts, n_rapid, n_cut = parse_gcode_toolpath(gcode_path)
-            self._toolpath_rapids = rapids
-            self._toolpath_cuts = cuts
-            self._log(f"[VIZ] Loaded toolpath: {gcode_path.name} "
-                        f"({n_cut} cuts, {n_rapid} rapids)")
-        except Exception as e:
-            self._log(f"[VIZ] Toolpath load failed ({gcode_path.name}): {e}")
-
-    self._refresh_viewport()
-    self.plotter.reset_camera()
-    self.btn_export.setEnabled(True)
-
-# ── Run-folder watcher ───────────────────────────────────────────────────
-def _start_run_watcher(self):
-    """Begin polling data/runs for a folder newer than what's there now."""
-    self._pre_scan_latest_run = self._get_latest_run_folder()
-    self._pending_load = None
-    if not hasattr(self, "_run_watch_timer"):
-        self._run_watch_timer = QTimer(self)
-        self._run_watch_timer.timeout.connect(self._check_for_new_run)
-    self._run_watch_timer.start(RUN_POLL_INTERVAL_MS)
-    self._log("[VIZ] Watching data/runs for new output...")
-
-def _stop_run_watcher(self):
-    if hasattr(self, "_run_watch_timer"):
-        self._run_watch_timer.stop()
-
-def _check_for_new_run(self):
-    latest = self._get_latest_run_folder()
-    if latest is None or latest == self._pre_scan_latest_run:
-        return
-
-    cloud_path, mesh_path, gcode_path = self._find_run_files(latest)
-    if cloud_path is None and mesh_path is None and gcode_path is None:
-        return
-
-    sizes = {}
-    for tag, p in (("cloud", cloud_path), ("mesh", mesh_path),
-                    ("gcode", gcode_path)):
-        if p is not None:
-            sizes[tag] = p.stat().st_size
-
-    if self._pending_load == (latest, sizes):
-        self._stop_run_watcher()
-        self._log(f"[VIZ] New run detected: {latest.name}")
-        self._load_run_files(latest)
-        self._pre_scan_latest_run = latest
-        self._pending_load = None
-    else:
-        self._pending_load = (latest, sizes)
-
-
 class SteppedScanWorker(QThread):
     """Drive the carriage to a list of angles, pausing for a capture at each.
 
@@ -1962,6 +1854,110 @@ class ScanToMillUI(QMainWindow):
             import traceback
             traceback.print_exc()
 
+    # ── Run-folder loader ────────────────────────────────────────────────
+    def _get_latest_run_folder(self):
+        """Most recently modified subfolder of data/runs, or None."""
+        if not RUNS_DIR.exists():
+            return None
+        folders = [f for f in RUNS_DIR.iterdir() if f.is_dir()]
+        if not folders:
+            return None
+        return max(folders, key=lambda f: f.stat().st_mtime)
+
+    def _find_run_files(self, run_dir: Path):
+        """Locate cloud, mesh, and toolpath files inside a run folder."""
+        cloud = run_dir / CLOUD_FILENAME
+        mesh  = run_dir / MESH_FILENAME
+        gcode = run_dir / TOOLPATH_FILENAME
+        return (
+            cloud if cloud.exists() else None,
+            mesh  if mesh.exists()  else None,
+            gcode if gcode.exists() else None,
+        )
+
+    def _load_run_files(self, run_dir: Path):
+        """Load cloud, mesh, and toolpath from run_dir into the viewport."""
+        if not hasattr(self, "plotter"):
+            self._log("[VIZ] Viewport not ready — cannot load run files.")
+            return
+
+        cloud_path, mesh_path, gcode_path = self._find_run_files(run_dir)
+        if cloud_path is None and mesh_path is None and gcode_path is None:
+            self._log(f"[VIZ] No output files in {run_dir.name}")
+            return
+
+        if cloud_path is not None:
+            try:
+                cloud = pv.read(str(cloud_path))
+                if "depth" not in cloud.point_data and cloud.n_points > 0:
+                    cloud["depth"] = cloud.points[:, 2]
+                self._cloud = cloud
+                self._log(f"[VIZ] Loaded cloud: {cloud_path.name} "
+                          f"({cloud.n_points} pts)")
+            except Exception as e:
+                self._log(f"[VIZ] Cloud load failed ({cloud_path.name}): {e}")
+
+        if mesh_path is not None:
+            try:
+                self._mesh = pv.read(str(mesh_path))
+                self._log(f"[VIZ] Loaded mesh: {mesh_path.name} "
+                          f"({self._mesh.n_cells} cells)")
+            except Exception as e:
+                self._log(f"[VIZ] Mesh load failed ({mesh_path.name}): {e}")
+
+        if gcode_path is not None:
+            try:
+                rapids, cuts, n_rapid, n_cut = parse_gcode_toolpath(gcode_path)
+                self._toolpath_rapids = rapids
+                self._toolpath_cuts = cuts
+                self._log(f"[VIZ] Loaded toolpath: {gcode_path.name} "
+                          f"({n_cut} cuts, {n_rapid} rapids)")
+            except Exception as e:
+                self._log(f"[VIZ] Toolpath load failed ({gcode_path.name}): {e}")
+
+        self._refresh_viewport()
+        self.plotter.reset_camera()
+        self.btn_export.setEnabled(True)
+
+    # ── Run-folder watcher ───────────────────────────────────────────────
+    def _start_run_watcher(self):
+        """Begin polling data/runs for a folder newer than what's there now."""
+        self._pre_scan_latest_run = self._get_latest_run_folder()
+        self._pending_load = None
+        if not hasattr(self, "_run_watch_timer"):
+            self._run_watch_timer = QTimer(self)
+            self._run_watch_timer.timeout.connect(self._check_for_new_run)
+        self._run_watch_timer.start(RUN_POLL_INTERVAL_MS)
+        self._log("[VIZ] Watching data/runs for new output...")
+
+    def _stop_run_watcher(self):
+        if hasattr(self, "_run_watch_timer"):
+            self._run_watch_timer.stop()
+
+    def _check_for_new_run(self):
+        latest = self._get_latest_run_folder()
+        if latest is None or latest == self._pre_scan_latest_run:
+            return
+
+        cloud_path, mesh_path, gcode_path = self._find_run_files(latest)
+        if cloud_path is None and mesh_path is None and gcode_path is None:
+            return
+
+        sizes = {}
+        for tag, p in (("cloud", cloud_path), ("mesh", mesh_path),
+                       ("gcode", gcode_path)):
+            if p is not None:
+                sizes[tag] = p.stat().st_size
+
+        if self._pending_load == (latest, sizes):
+            self._stop_run_watcher()
+            self._log(f"[VIZ] New run detected: {latest.name}")
+            self._load_run_files(latest)
+            self._pre_scan_latest_run = latest
+            self._pending_load = None
+        else:
+            self._pending_load = (latest, sizes)
+            
     def _make_estop_banner(self):
         self.estop_banner = QLabel("⚠  EMERGENCY STOP ENGAGED  ⚠", self)
         self.estop_banner.setAlignment(Qt.AlignmentFlag.AlignCenter)
